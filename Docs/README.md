@@ -233,9 +233,6 @@ Two public benchmark datasets are included in `examples/`:
 
 ---
 
-## Reproducing the Paper Results
-
-The results in [*GeostatisticsLab: An open-source QGIS plugin for complete geostatistical workflows* (Computers & Geosciences, in review)] can be reproduced as follows.
 
 ### SIC97 case study
 
