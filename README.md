@@ -39,7 +39,7 @@ No additional installation is required.
 ### Manual
 1. Clone this repository:
    ```bash
-   git clone https://github.com/stebond/GeostatisticsLab.git
+   git clone https://github.com/[username]/GeostatisticsLab.git
    ```
 2. Copy the `GeostatisticsLab/` folder to your QGIS plugins directory:
    - **Windows:** `%APPDATA%\QGIS\QGIS3\profiles\default\python\plugins\`
