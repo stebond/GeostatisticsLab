@@ -22,7 +22,7 @@ from qgis.PyQt import uic, QtWidgets, QtCore, QtGui
 from qgis.core import (QgsMapLayerProxyModel, NULL, QgsRasterLayer, QgsProject,
                        QgsVectorLayer, QgsField, QgsFeature, QgsGeometry,
                        QgsPointXY)
-from qgis.PyQt.QtCore import QVariant
+from qgis.PyQt.QtCore import QVariant, QSettings
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 
@@ -245,6 +245,14 @@ class GeostatisticsLabDialog(QtWidgets.QDialog, FORM_CLASS):
         self.checkBox_h_boxplot.stateChanged.connect(self.on_plot_options_changed)
         if hasattr(self, 'checkBox_cum_hist'):
             self.checkBox_cum_hist.stateChanged.connect(self.on_cum_hist_changed)
+
+        # Enable/disable lag_tolerance spinbox immediately when the user
+        # switches between fixed-lag and adaptive-lag mode, without waiting
+        # for Calculate to be pressed.
+        if hasattr(self, 'radioButton_adaptive_lag'):
+            self.radioButton_adaptive_lag.toggled.connect(self._on_lag_mode_toggled)
+        if hasattr(self, 'radioButton_fixed_lag'):
+            self.radioButton_fixed_lag.toggled.connect(self._on_lag_mode_toggled)
             
         # Connect theoretical-model checkbox to instantly refresh the variogram plot
         if hasattr(self, 'checkBox_theoretical_model'):
@@ -287,6 +295,20 @@ class GeostatisticsLabDialog(QtWidgets.QDialog, FORM_CLASS):
         # Connect GSLIB Model Export action button
         if hasattr(self, 'pushButton_export_vrg_model'):
             self.pushButton_export_vrg_model.clicked.connect(self.export_gslib_model)
+        if hasattr(self, 'pushButton_export_variogram_to_png'):
+            self.pushButton_export_variogram_to_png.clicked.connect(self.export_variogram_to_png)
+        if hasattr(self, 'pushButton_export_variogram_map_to_png'):
+            self.pushButton_export_variogram_map_to_png.clicked.connect(self.export_variogram_map_to_png)
+        if hasattr(self, 'pushButton_export_Cross_kriging_plot_to_png'):
+            self.pushButton_export_Cross_kriging_plot_to_png.clicked.connect(self.export_cross_kriging_plot_to_png)
+        if hasattr(self, 'pushButton_export_Cross_kriging_map_to_png'):
+            self.pushButton_export_Cross_kriging_map_to_png.clicked.connect(self.export_cross_kriging_map_to_png)
+        if hasattr(self, 'pushButton_export_histo_to_png'):
+            self.pushButton_export_histo_to_png.clicked.connect(self.export_histo_to_png)
+        if hasattr(self, 'pushButton_exportQQplot_to_png'):
+            self.pushButton_exportQQplot_to_png.clicked.connect(self.export_qqplot_to_png)
+        if hasattr(self, 'pushButton_export_declus_plot_to_png'):
+            self.pushButton_export_declus_plot_to_png.clicked.connect(self.export_declus_plot_to_png)
 
         # -- Normal Score Transform connections --
         self.mFieldComboBox.fieldChanged.connect(self._on_field_changed_nscore)
@@ -759,6 +781,18 @@ class GeostatisticsLabDialog(QtWidgets.QDialog, FORM_CLASS):
                 "or checking the experimental variogram data."
             )
 
+    def _on_lag_mode_toggled(self, *args):
+        """Enable or disable the lag_tolerance spinbox immediately when the
+        user switches between fixed-lag and adaptive-lag mode.
+
+        In adaptive mode the tolerance is always lag/2 and is set
+        automatically, so manual editing is meaningless and confusing.
+        In fixed mode the user is free to set any tolerance value.
+        """
+        is_adaptive = (hasattr(self, 'radioButton_adaptive_lag') and
+                       self.radioButton_adaptive_lag.isChecked())
+        self.doubleSpinBox_lag_tolerance.setEnabled(not is_adaptive)
+
     def on_plot_options_changed(self):
         if self.last_lags is not None and self.last_results is not None:
             self.plot_multi_variogram(self.last_lags, self.last_results)
@@ -780,6 +814,364 @@ class GeostatisticsLabDialog(QtWidgets.QDialog, FORM_CLASS):
                 'a3': self.tableWidget_models.cellWidget(row, 7).value()
             })
         return structures
+
+    def export_variogram_to_png(self):
+        """Export the current variogram plot to a PNG file.
+
+        Asks the user for the output resolution (DPI), then opens a Save
+        dialog pre-filled with a timestamped filename built from the current
+        layer name and field name.  The suggested folder is the one most
+        recently used (or the user home directory on first use).
+        """
+        if self.last_lags is None or self.last_results is None:
+            QtWidgets.QMessageBox.warning(
+                self, "Export variogram",
+                "No variogram has been calculated yet.\n"
+                "Please run Calculate first.")
+            return
+
+        # -- 1. Ask for DPI --------------------------------------------------
+        dpi, ok = QtWidgets.QInputDialog.getInt(
+            self, "Export resolution",
+            "Output resolution (DPI):",
+            value=300, min=72, max=1200, step=50)
+        if not ok:
+            return
+
+        # -- 2. Build suggested filename -------------------------------------
+        import datetime, re
+        now        = datetime.datetime.now()
+        timestamp  = now.strftime('%Y_%m_%d_%H_%M_%S')
+
+        layer = self.mMapLayerComboBox.currentLayer()
+        field = self.mFieldComboBox.currentField()
+
+        layer_name = layer.name() if layer else 'layer'
+        field_name = field        if field  else 'variable'
+
+        # Sanitise: replace characters not allowed in filenames with _
+        def safe(s):
+            return re.sub(r'[\\/:*?"<>|]', '_', s)
+
+        suggested_name = (
+            f"{timestamp}_{safe(layer_name)}_{safe(field_name)}_variogram.png"
+        )
+
+        # Retrieve last-used directory from QSettings, fall back to home
+        settings    = QSettings()
+        last_dir    = settings.value('GeostatisticsLab/export_dir',
+                                     os.path.expanduser('~'))
+        suggested   = os.path.join(last_dir, suggested_name)
+
+        # -- 3. Save dialog --------------------------------------------------
+        file_path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "Export variogram to PNG",
+            suggested,
+            "PNG images (*.png);;All files (*.*)"
+        )
+        if not file_path:
+            return
+
+        # Ensure .png extension
+        if not file_path.lower().endswith('.png'):
+            file_path += '.png'
+
+        # Remember the chosen directory for next time
+        settings.setValue('GeostatisticsLab/export_dir',
+                          os.path.dirname(file_path))
+
+        # -- 4. Save the figure ----------------------------------------------
+        try:
+            self.figure_vario.savefig(
+                file_path,
+                dpi=dpi,
+                bbox_inches='tight',
+                facecolor=self.figure_vario.get_facecolor()
+            )
+            QtWidgets.QMessageBox.information(
+                self, "Export variogram",
+                f"Variogram exported successfully:\n{file_path}\n(DPI: {dpi})")
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(
+                self, "Export variogram",
+                f"Failed to save the image:\n{str(e)}")
+
+    def export_variogram_map_to_png(self):
+        """Export the current variogram map plot to a PNG file.
+
+        Mirrors export_variogram_to_png but targets figure_vario_map and
+        uses the suffix '_variogram_map' in the suggested filename.
+        """
+        # Check that the variogram map has been calculated
+        ax_list = self.figure_vario_map.get_axes()
+        if not ax_list:
+            QtWidgets.QMessageBox.warning(
+                self, "Export variogram map",
+                "No variogram map has been calculated yet.\n"
+                "Please run Calculate first.")
+            return
+
+        # -- 1. Ask for DPI --------------------------------------------------
+        dpi, ok = QtWidgets.QInputDialog.getInt(
+            self, "Export resolution",
+            "Output resolution (DPI):",
+            value=300, min=72, max=1200, step=50)
+        if not ok:
+            return
+
+        # -- 2. Build suggested filename -------------------------------------
+        import datetime, re
+        now       = datetime.datetime.now()
+        timestamp = now.strftime('%Y_%m_%d_%H_%M_%S')
+
+        layer = self.mMapLayerComboBox.currentLayer()
+        field = self.mFieldComboBox.currentField()
+
+        layer_name = layer.name() if layer else 'layer'
+        field_name = field        if field  else 'variable'
+
+        def safe(s):
+            return re.sub(r'[\\/:*?"<>|]', '_', s)
+
+        suggested_name = (
+            f"{timestamp}_{safe(layer_name)}_{safe(field_name)}_variogram_map.png"
+        )
+
+        settings  = QSettings()
+        last_dir  = settings.value('GeostatisticsLab/export_dir',
+                                   os.path.expanduser('~'))
+        suggested = os.path.join(last_dir, suggested_name)
+
+        # -- 3. Save dialog --------------------------------------------------
+        file_path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "Export variogram map to PNG",
+            suggested,
+            "PNG images (*.png);;All files (*.*)"
+        )
+        if not file_path:
+            return
+
+        if not file_path.lower().endswith('.png'):
+            file_path += '.png'
+
+        settings.setValue('GeostatisticsLab/export_dir',
+                          os.path.dirname(file_path))
+
+        # -- 4. Save the figure ----------------------------------------------
+        try:
+            self.figure_vario_map.savefig(
+                file_path,
+                dpi=dpi,
+                bbox_inches='tight',
+                facecolor=self.figure_vario_map.get_facecolor()
+            )
+            QtWidgets.QMessageBox.information(
+                self, "Export variogram map",
+                f"Variogram map exported successfully:\n{file_path}\n(DPI: {dpi})")
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(
+                self, "Export variogram map",
+                f"Failed to save the image:\n{str(e)}")
+
+    def export_cross_kriging_plot_to_png(self):
+        """Export the cross-validation scatter plot to a PNG file."""
+        if not self.figure_cross.get_axes():
+            QtWidgets.QMessageBox.warning(
+                self, "Export cross-kriging plot",
+                "No cross-validation plot available.\n"
+                "Please run cross-validation first.")
+            return
+
+        dpi, ok = QtWidgets.QInputDialog.getInt(
+            self, "Export resolution",
+            "Output resolution (DPI):",
+            value=300, min=72, max=1200, step=50)
+        if not ok:
+            return
+
+        import datetime, re
+        now       = datetime.datetime.now()
+        timestamp = now.strftime('%Y_%m_%d_%H_%M_%S')
+
+        layer = self.mMapLayerComboBox.currentLayer()
+        field = self.mFieldComboBox.currentField()
+
+        def safe(s):
+            return re.sub(r'[\\/:*?"<>|]', '_', s)
+
+        suggested_name = (
+            f"{timestamp}_{safe(layer.name() if layer else 'layer')}"
+            f"_{safe(field if field else 'variable')}_cross_kriging_plot.png"
+        )
+
+        settings  = QSettings()
+        last_dir  = settings.value('GeostatisticsLab/export_dir',
+                                   os.path.expanduser('~'))
+
+        file_path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "Export cross-kriging plot to PNG",
+            os.path.join(last_dir, suggested_name),
+            "PNG images (*.png);;All files (*.*)"
+        )
+        if not file_path:
+            return
+
+        if not file_path.lower().endswith('.png'):
+            file_path += '.png'
+
+        settings.setValue('GeostatisticsLab/export_dir',
+                          os.path.dirname(file_path))
+
+        try:
+            self.figure_cross.savefig(
+                file_path, dpi=dpi, bbox_inches='tight',
+                facecolor=self.figure_cross.get_facecolor())
+            QtWidgets.QMessageBox.information(
+                self, "Export cross-kriging plot",
+                f"Cross-kriging plot exported successfully:\n{file_path}\n(DPI: {dpi})")
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(
+                self, "Export cross-kriging plot",
+                f"Failed to save the image:\n{str(e)}")
+
+    def export_cross_kriging_map_to_png(self):
+        """Export the cross-validation spatial error map to a PNG file."""
+        if not self.figure_cross_map.get_axes():
+            QtWidgets.QMessageBox.warning(
+                self, "Export cross-kriging map",
+                "No cross-validation map available.\n"
+                "Please run cross-validation first.")
+            return
+
+        dpi, ok = QtWidgets.QInputDialog.getInt(
+            self, "Export resolution",
+            "Output resolution (DPI):",
+            value=300, min=72, max=1200, step=50)
+        if not ok:
+            return
+
+        import datetime, re
+        now       = datetime.datetime.now()
+        timestamp = now.strftime('%Y_%m_%d_%H_%M_%S')
+
+        layer = self.mMapLayerComboBox.currentLayer()
+        field = self.mFieldComboBox.currentField()
+
+        def safe(s):
+            return re.sub(r'[\\/:*?"<>|]', '_', s)
+
+        suggested_name = (
+            f"{timestamp}_{safe(layer.name() if layer else 'layer')}"
+            f"_{safe(field if field else 'variable')}_cross_kriging_map.png"
+        )
+
+        settings  = QSettings()
+        last_dir  = settings.value('GeostatisticsLab/export_dir',
+                                   os.path.expanduser('~'))
+
+        file_path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "Export cross-kriging map to PNG",
+            os.path.join(last_dir, suggested_name),
+            "PNG images (*.png);;All files (*.*)"
+        )
+        if not file_path:
+            return
+
+        if not file_path.lower().endswith('.png'):
+            file_path += '.png'
+
+        settings.setValue('GeostatisticsLab/export_dir',
+                          os.path.dirname(file_path))
+
+        try:
+            self.figure_cross_map.savefig(
+                file_path, dpi=dpi, bbox_inches='tight',
+                facecolor=self.figure_cross_map.get_facecolor())
+            QtWidgets.QMessageBox.information(
+                self, "Export cross-kriging map",
+                f"Cross-kriging map exported successfully:\n{file_path}\n(DPI: {dpi})")
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(
+                self, "Export cross-kriging map",
+                f"Failed to save the image:\n{str(e)}")
+
+    def _export_figure_to_png(self, figure, title, suffix):
+        """Generic helper: ask DPI, ask save path, save figure.
+
+        :param figure:  matplotlib Figure to export.
+        :param title:   Short label used in dialog titles and message boxes.
+        :param suffix:  String appended before .png in the suggested filename
+                        (e.g. 'histogram', 'qqplot', 'declustering_plot').
+        """
+        if not figure.get_axes():
+            QtWidgets.QMessageBox.warning(
+                self, f"Export {title}",
+                f"No {title} available yet.\nPlease run the analysis first.")
+            return
+
+        dpi, ok = QtWidgets.QInputDialog.getInt(
+            self, "Export resolution",
+            "Output resolution (DPI):",
+            value=300, min=72, max=1200, step=50)
+        if not ok:
+            return
+
+        import datetime, re
+        timestamp  = datetime.datetime.now().strftime('%Y_%m_%d_%H_%M_%S')
+        layer      = self.mMapLayerComboBox.currentLayer()
+        field      = self.mFieldComboBox.currentField()
+
+        def safe(s):
+            return re.sub(r'[\\/:*?"<>|]', '_', s)
+
+        suggested_name = (
+            f"{timestamp}_{safe(layer.name() if layer else 'layer')}"
+            f"_{safe(field if field else 'variable')}_{suffix}.png"
+        )
+
+        settings = QSettings()
+        last_dir = settings.value('GeostatisticsLab/export_dir',
+                                  os.path.expanduser('~'))
+
+        file_path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, f"Export {title} to PNG",
+            os.path.join(last_dir, suggested_name),
+            "PNG images (*.png);;All files (*.*)"
+        )
+        if not file_path:
+            return
+        if not file_path.lower().endswith('.png'):
+            file_path += '.png'
+
+        settings.setValue('GeostatisticsLab/export_dir',
+                          os.path.dirname(file_path))
+        try:
+            figure.savefig(file_path, dpi=dpi, bbox_inches='tight',
+                           facecolor=figure.get_facecolor())
+            QtWidgets.QMessageBox.information(
+                self, f"Export {title}",
+                f"{title} exported successfully:\n{file_path}\n(DPI: {dpi})")
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(
+                self, f"Export {title}",
+                f"Failed to save the image:\n{str(e)}")
+
+    def export_histo_to_png(self):
+        """Export the histogram plot to PNG."""
+        self._export_figure_to_png(self.figure_histo, "histogram", "histogram")
+
+    def export_qqplot_to_png(self):
+        """Export the Q-Q plot to PNG."""
+        self._export_figure_to_png(self.figure_qqplot, "Q-Q plot", "qqplot")
+
+    def export_declus_plot_to_png(self):
+        """Export the declustering diagnostic plot to PNG."""
+        self._export_figure_to_png(self.figure_decluster, "declustering plot",
+                                   "declustering_plot")
 
     def export_gslib_model(self):
         structures = self.get_models_from_table()
@@ -1303,7 +1695,12 @@ class GeostatisticsLabDialog(QtWidgets.QDialog, FORM_CLASS):
         self.doubleSpinBox_lag_tolerance.blockSignals(True)
         self.doubleSpinBox_lag_tolerance.setValue(lag_tol)
         self.doubleSpinBox_lag_tolerance.blockSignals(False)
-        self.doubleSpinBox_lag_tolerance.setEnabled(False)
+        # Disable manual editing only in adaptive mode: lag_tol is always
+        # lag/2 and is derived automatically. In fixed mode the user can
+        # set any tolerance they like.
+        is_adaptive = (hasattr(self, 'radioButton_adaptive_lag') and
+                       self.radioButton_adaptive_lag.isChecked())
+        self.doubleSpinBox_lag_tolerance.setEnabled(not is_adaptive)
         azimuths = [(base_azimuth + d * (180.0 / num_dirs)) % 180.0 for d in range(num_dirs)]
         ang_tol_rad = np.radians(ang_tol)
         variogram_results = {}
