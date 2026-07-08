@@ -57,7 +57,7 @@ No additional installation is required.
 5. **Kriging tab** — choose **Ordinary**, configure the grid, press **Calculate!**
 6. **Probability Maps tab** — select the output rasters, set a threshold, press **Run!**
 
-Full step-by-step tutorials are in [`docs/tutorial_sic97.md`](docs/tutorial_sic97.md) and [`docs/tutorial_walker_lake.md`](docs/tutorial_walker_lake.md).
+Full step-by-step tutorials are in [`Docs/tutorial_sic97.md`](Docs/tutorial_sic97.md) and [`Docs/tutorial_walker_lake.md`](Docs/tutorial_walker_lake.md).
 
 ---
 
