@@ -24,7 +24,6 @@ Developed at **DICAM – University of Bologna**.
   - [Kriging](#kriging-tab)
   - [Probability Maps](#probability-maps-tab)
 - [Example Datasets](#example-datasets)
-- [Reproducing the Paper Results](#reproducing-the-paper-results)
 - [Repository Structure](#repository-structure)
 - [Citation](#citation)
 - [License](#license)
@@ -86,7 +85,7 @@ All dependencies ship with the standard QGIS Python environment on Windows, macO
 
 1. Clone or download this repository:
    ```bash
-   git clone https://github.com/[username]/GeostatisticsLab.git
+   git clone https://github.com/stebond/GeostatisticsLab.git
    ```
 2. Copy the `GeostatisticsLab/` folder to your QGIS plugins directory:
    - **Windows:** `%APPDATA%\QGIS\QGIS3\profiles\default\python\plugins\`
