@@ -1,5 +1,5 @@
 <RCC>
-    <qresource prefix="/plugins/geostatisticslab" >
+    <qresource prefix="/plugins/GeostatisticsLab" >
         <file>icon.png</file>
     </qresource>
 </RCC>
