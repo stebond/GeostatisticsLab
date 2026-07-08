@@ -107,7 +107,7 @@ After enabling the plugin, its icon should appear in the QGIS toolbar. Click it 
 5. In the **Kriging** tab: choose **Ordinary**, set the grid, press **Calculate!**
 6. In the **Probability Maps** tab: select the output rasters, set a threshold, press **Run!**
 
-A complete step-by-step tutorial is provided in [`/tutorial_sic97.md`](/tutorial_sic97.md).
+A complete step-by-step tutorial is provided in [`/Docs/tutorial_sic97.md`](/Docs/tutorial_sic97.md).
 
 ---
 
