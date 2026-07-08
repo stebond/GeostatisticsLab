@@ -108,7 +108,7 @@ After enabling the plugin, its icon should appear in the QGIS toolbar. Click it 
 5. In the **Kriging** tab: choose **Ordinary**, set the grid, press **Calculate!**
 6. In the **Probability Maps** tab: select the output rasters, set a threshold, press **Run!**
 
-A complete step-by-step tutorial is provided in [`docs/tutorial_sic97.md`](docs/tutorial_sic97.md).
+A complete step-by-step tutorial is provided in [`/tutorial_sic97.md`](/tutorial_sic97.md).
 
 ---
 
@@ -219,7 +219,7 @@ Two public benchmark datasets are included in `examples/`:
 
 ### `sic97.dat`
 - **Source:** Dubois, G. (1998). Spatial interpolation comparison 97. *Journal of Geographic Information and Decision Analysis* 2(2), 1–10.
-- **Content:** 200 measurements of Caesium-137 deposition (Bq/m²) after the Chernobyl accident, southern Germany.
+- **Content:** 467 measurements of rainfall, Switzerland.
 - **Columns:** `x` (Easting, m), `y` (Northing, m), `value` (Bq/m²)
 - **Delimiter:** space
 - **Recommended field:** `value`
