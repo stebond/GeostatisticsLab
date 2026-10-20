@@ -13,7 +13,13 @@
  ***************************************************************************/
 """
 
+import csv
 import os
+import platform
+import re
+import subprocess
+import sys
+import time
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
@@ -28,6 +34,791 @@ from matplotlib.figure import Figure
 
 FORM_CLASS, _ = uic.loadUiType(os.path.join(
     os.path.dirname(__file__), 'geostatisticslab_dialog_base.ui'))
+
+
+def _hw_cpu_name():
+    """Marketing name of the processor, or '' if it cannot be found."""
+    name = ''
+    try:
+        if sys.platform.startswith('win'):
+            import winreg
+            key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                                 r"HARDWARE\DESCRIPTION\System\CentralProcessor\0")
+            name = winreg.QueryValueEx(key, "ProcessorNameString")[0]
+        elif sys.platform == 'darwin':
+            name = subprocess.check_output(['sysctl', '-n', 'machdep.cpu.brand_string'],
+                                           timeout=5).decode('utf-8', 'ignore')
+        else:
+            with open('/proc/cpuinfo', encoding='utf-8', errors='ignore') as fh:
+                for line in fh:
+                    if line.lower().startswith(('model name', 'hardware', 'cpu model')):
+                        name = line.split(':', 1)[1]
+                        break
+    except Exception:
+        name = ''
+    if not name:
+        name = platform.processor()
+    name = re.sub(r'\((R|TM)\)', '', name, flags=re.I)
+    name = re.sub(r'\b(CPU|Processor)\b', '', name, flags=re.I)
+    return re.sub(r'\s+', ' ', name).strip()
+
+
+def _hw_cpu_cores():
+    """(physical, logical) number of cores; physical is None if it cannot be found."""
+    logical = os.cpu_count()
+    physical = None
+    try:
+        import psutil
+        physical = psutil.cpu_count(logical=False)
+        logical = psutil.cpu_count(logical=True) or logical
+    except Exception:
+        if sys.platform == 'darwin':
+            try:
+                physical = int(subprocess.check_output(['sysctl', '-n', 'hw.physicalcpu'],
+                                                       timeout=5))
+            except Exception:
+                physical = None
+        elif sys.platform.startswith('linux'):
+            try:
+                pairs = set()
+                phys_id = None
+                with open('/proc/cpuinfo', encoding='utf-8', errors='ignore') as fh:
+                    for line in fh:
+                        if line.startswith('physical id'):
+                            phys_id = line.split(':')[1].strip()
+                        elif line.startswith('core id'):
+                            pairs.add((phys_id, line.split(':')[1].strip()))
+                physical = len(pairs) or None
+            except Exception:
+                physical = None
+    return physical, logical
+
+
+def _hw_ram_bytes():
+    """Installed physical memory in bytes, or None."""
+    try:
+        import psutil
+        return int(psutil.virtual_memory().total)
+    except Exception:
+        pass
+    try:
+        if sys.platform.startswith('win'):
+            import ctypes
+
+            class MEMORYSTATUSEX(ctypes.Structure):
+                _fields_ = [('dwLength', ctypes.c_ulong), ('dwMemoryLoad', ctypes.c_ulong),
+                            ('ullTotalPhys', ctypes.c_ulonglong),
+                            ('ullAvailPhys', ctypes.c_ulonglong),
+                            ('ullTotalPageFile', ctypes.c_ulonglong),
+                            ('ullAvailPageFile', ctypes.c_ulonglong),
+                            ('ullTotalVirtual', ctypes.c_ulonglong),
+                            ('ullAvailVirtual', ctypes.c_ulonglong),
+                            ('sullAvailExtendedVirtual', ctypes.c_ulonglong)]
+            st = MEMORYSTATUSEX()
+            st.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+            ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(st))
+            return int(st.ullTotalPhys)
+        if sys.platform == 'darwin':
+            return int(subprocess.check_output(['sysctl', '-n', 'hw.memsize'], timeout=5))
+        with open('/proc/meminfo', encoding='utf-8', errors='ignore') as fh:
+            for line in fh:
+                if line.startswith('MemTotal'):
+                    return int(line.split()[1]) * 1024
+    except Exception:
+        pass
+    return None
+
+
+def _hw_os_name():
+    """Operating system with its version."""
+    try:
+        if sys.platform.startswith('win'):
+            build = platform.version().split('.')[-1]
+            release = platform.release()
+            # Windows 11 still reports release 10; it is recognised by the build number
+            if release == '10' and build.isdigit() and int(build) >= 22000:
+                release = '11'
+            return 'Windows %s (build %s)' % (release, build) if build.isdigit() else 'Windows %s' % release
+        if sys.platform == 'darwin':
+            return 'macOS %s' % platform.mac_ver()[0]
+        with open('/etc/os-release', encoding='utf-8', errors='ignore') as fh:
+            for line in fh:
+                if line.startswith('PRETTY_NAME='):
+                    return line.split('=', 1)[1].strip().strip('"')
+    except Exception:
+        pass
+    return '%s %s' % (platform.system(), platform.release())
+
+
+def hardware_description():
+    """One paragraph describing the machine and the software, ready to be pasted in a
+    publication. Every item that cannot be determined is simply left out."""
+    cpu = _hw_cpu_name()
+    physical, logical = _hw_cpu_cores()
+    ram = _hw_ram_bytes()
+    if cpu:
+        proc = '%s %s processor' % ('an' if re.match(r'(?i)[aeiou]|(8|11|18)(\D|$)', cpu) else 'a', cpu)
+        if physical and logical:
+            proc += ' (%d physical cores, %d logical processors)' % (physical, logical)
+        elif logical:
+            proc += ' (%d logical processors)' % logical
+    else:
+        proc = 'a processor with %s logical processors' % (logical or 'an unknown number of')
+    parts = [proc]
+    if ram:
+        parts.append('%d GB of RAM' % int(round(ram / 1024.0 ** 3)))
+    parts.append('%s' % _hw_os_name())
+    text = 'The tests were run on a computer with ' + ', '.join(parts[:-1]) + ' and ' + parts[-1]
+    sw = []
+    try:
+        from qgis.core import Qgis
+        sw.append('QGIS %s' % Qgis.QGIS_VERSION.split('-')[0])
+    except Exception:
+        pass
+    sw.append('Python %s' % platform.python_version())
+    sw.append('NumPy %s' % np.__version__)
+    try:
+        import matplotlib
+        sw.append('Matplotlib %s' % matplotlib.__version__)
+    except Exception:
+        pass
+    try:
+        from osgeo import gdal
+        sw.append('GDAL %s' % gdal.VersionInfo('RELEASE_NAME'))
+    except Exception:
+        pass
+    return text + '. The software versions were ' + ', '.join(sw) + '.'
+
+
+
+# ----------------------------------------------------------------------
+# Kriging parameter file (.kriging_par), in the style of the GSLIB parameter files:
+# one value (or group of values) per line, followed by a description after a backslash.
+# ----------------------------------------------------------------------
+KRIGING_PAR_EXT = '.kriging_par'
+KRIGING_PAR_VERSION = 1
+KRIGING_PAR_MODELS = ["Nugget", "Spherical", "Exponential", "Gaussian", "Linear", "Cubic"]
+KRIGING_PAR_TYPES = ('SK', 'OK', 'UK')
+
+
+def _kp_text(value):
+    """Free text on one line: empty -> '-', no backslashes and no line breaks."""
+    value = ('%s' % (value or '')).replace('\\', '/').replace('\r', ' ').replace('\n', ' ').strip()
+    return value if value else '-'
+
+
+def kriging_par_write(path, p, structures=None):
+    """Write the kriging parameters of dict `p` (see _kriging_par_collect) in `path`.
+    `structures` is a list of dicts (type, sill, r1, r2, r3, a1, a2, a3) or None/[] when
+    the variogram model is not stored."""
+    structures = structures or []
+    lines = []
+
+    def put(value, comment):
+        lines.append('%s \\%s' % (value.ljust(34), comment))
+
+    def g(v):
+        return '%.10g' % v
+
+    lines.append('                  Parameters for GeostatisticsLab KRIGING')
+    lines.append('                  ***************************************')
+    lines.append('')
+    lines.append('START OF PARAMETERS:')
+    put('%d' % KRIGING_PAR_VERSION, 'file format version')
+    put(p['type'], 'kriging type: SK, OK or UK')
+    put(g(p['mean_sk']), 'mean for simple kriging')
+    put('%d' % (1 if p['on_points'] else 0), 'estimation target: 0=grid, 1=points')
+    put('%d  %s  %s' % (p['nx'], g(p['xmin']), g(p['dx'])), 'nx,xmn,xsiz')
+    put('%d  %s  %s' % (p['ny'], g(p['ymin']), g(p['dy'])), 'ny,ymn,ysiz')
+    put('%d  %d' % (p['pts_min'], p['pts_max']), 'min, max data for kriging')
+    put('%s  %s' % (g(p['r_max']), g(p['r_min'])), 'maximum search radii: major, minor')
+    put(g(p['azimuth']), 'azimuth of the major search axis (geographic degrees)')
+    put('%d  %d' % (1 if p['octants'] else 0, p['min_octant']),
+        'octant search (0=no, 1=yes), min data per octant')
+    put(_kp_text(p['layer']), 'data layer')
+    put(_kp_text(p['field']), 'data variable')
+    put(_kp_text(p['out_raster']), 'name of the output raster (grid target)')
+    put(_kp_text(p['points_layer']), 'layer with the estimation points (points target)')
+    put(_kp_text(p['out_points']), 'name of the output point layer (points target)')
+    put('%d' % len(structures), 'number of variogram structures (0 = model not stored)')
+    for k, st in enumerate(structures, 1):
+        put('%s  %s  %s  %s  %s  %s  %s  %s' % (
+            st['type'], g(st['sill']), g(st['r1']), g(st['r2']), g(st['r3']),
+            g(st['a1']), g(st['a2']), g(st['a3'])),
+            'structure %d: type,sill,range1,range2,range3,ang1,ang2,ang3' % k)
+    with open(path, 'w', encoding='utf-8', newline='\n') as fh:
+        fh.write('\n'.join(lines) + '\n')
+
+
+def kriging_par_read(path):
+    """Read a .kriging_par file. Returns (p, structures); raises ValueError with a message
+    that names the line when the file is not valid. `structures` is [] when the file does
+    not contain the variogram model."""
+    with open(path, 'r', encoding='utf-8-sig') as fh:
+        raw = fh.read().splitlines()
+    start = None
+    for i, line in enumerate(raw):
+        if line.strip().upper().startswith('START OF PARAMETERS'):
+            start = i + 1
+            break
+    if start is None:
+        raise ValueError('"START OF PARAMETERS:" not found: this is not a kriging parameter file.')
+    rows = []
+    for i in range(start, len(raw)):
+        if not raw[i].strip():
+            continue
+        rows.append((i + 1, re.split(r'\s\\', raw[i], maxsplit=1)[0].strip()))
+    pos = [0]
+
+    def nxt():
+        if pos[0] >= len(rows):
+            raise ValueError('Unexpected end of file after line %d.' % (rows[-1][0] if rows else start))
+        r = rows[pos[0]]
+        pos[0] += 1
+        return r
+
+    def nums(count, cast, what):
+        ln, txt = nxt()
+        parts = txt.split()
+        if len(parts) < count:
+            raise ValueError('Line %d: %s expected (%d values).' % (ln, what, count))
+        try:
+            return [cast(x) for x in parts[:count]]
+        except ValueError:
+            raise ValueError('Line %d: invalid number in "%s" (%s).' % (ln, txt, what))
+
+    def text():
+        txt = nxt()[1]
+        return '' if txt == '-' else txt
+
+    p = {}
+    ver = nums(1, int, 'format version')[0]
+    if ver != KRIGING_PAR_VERSION:
+        raise ValueError('Unsupported file format version: %d.' % ver)
+    ln, txt = nxt()
+    p['type'] = txt.split()[0].upper() if txt.split() else ''
+    if p['type'] not in KRIGING_PAR_TYPES:
+        raise ValueError('Line %d: kriging type must be SK, OK or UK (found "%s").' % (ln, txt))
+    p['mean_sk'] = nums(1, float, 'mean for simple kriging')[0]
+    p['on_points'] = bool(nums(1, int, 'estimation target')[0])
+    p['nx'], p['xmin'], p['dx'] = None, None, None
+    v = nums(3, float, 'nx,xmn,xsiz')
+    p['nx'], p['xmin'], p['dx'] = int(v[0]), v[1], v[2]
+    v = nums(3, float, 'ny,ymn,ysiz')
+    p['ny'], p['ymin'], p['dy'] = int(v[0]), v[1], v[2]
+    if p['nx'] < 1 or p['ny'] < 1:
+        raise ValueError('The number of nodes nx and ny must be at least 1.')
+    p['pts_min'], p['pts_max'] = nums(2, int, 'min, max data for kriging')
+    p['r_max'], p['r_min'] = nums(2, float, 'maximum search radii')
+    p['azimuth'] = nums(1, float, 'search azimuth')[0]
+    flag, p['min_octant'] = nums(2, int, 'octant search')
+    p['octants'] = bool(flag)
+    p['layer'] = text()
+    p['field'] = text()
+    p['out_raster'] = text()
+    p['points_layer'] = text()
+    p['out_points'] = text()
+    nst = nums(1, int, 'number of variogram structures')[0]
+    structures = []
+    for k in range(nst):
+        ln, txt = nxt()
+        parts = txt.split()
+        if len(parts) < 8:
+            raise ValueError('Line %d: structure %d needs type,sill,range1,range2,range3,ang1,ang2,ang3.' % (ln, k + 1))
+        names = {m.lower(): m for m in KRIGING_PAR_MODELS}
+        if parts[0].lower() not in names:
+            raise ValueError('Line %d: unknown variogram model "%s".' % (ln, parts[0]))
+        try:
+            vals = [float(x) for x in parts[1:8]]
+        except ValueError:
+            raise ValueError('Line %d: invalid number in "%s".' % (ln, txt))
+        structures.append(dict(zip(('type', 'sill', 'r1', 'r2', 'r3', 'a1', 'a2', 'a3'),
+                                   [names[parts[0].lower()]] + vals)))
+    return p, structures
+
+
+# ===========================================================================
+# Plot customisation (tab "Settings")
+# ---------------------------------------------------------------------------
+# Every plot of the GUI lives in a StyledCanvas. Just before the canvas is
+# drawn, the style chosen by the user for that plot (if any) is applied to the
+# matplotlib figure. A property left on "Default" is never touched: the plot
+# looks exactly as drawn by the plugin. The original value of each property is
+# remembered, so going back to "Default" (or "Reset") restores the plot.
+# The settings are stored in a JSON file and re-loaded at the next session.
+# ===========================================================================
+import json
+import matplotlib as _mpl
+from matplotlib import colors as _mcolors
+from matplotlib.collections import PathCollection as _PathCollection
+from matplotlib.legend import Legend as _Legend
+from matplotlib.lines import Line2D as _Line2D
+from matplotlib.ticker import FormatStrFormatter as _FormatStrFormatter
+
+PLOT_REGISTRY = [
+    ('histo',        'Histogram'),
+    ('qqplot',       'Q-Q plot'),
+    ('decluster',    'Declustering'),
+    ('vario',        'Variogram / AutoVar'),
+    ('vario_map',    'Variogram map'),
+    ('vario_map_3d', 'Variogram map (3D)'),
+    ('cross',        'Cross-validation: scatter plot'),
+    ('cross_map',    'Cross-validation: map'),
+    ('cross_neighb', 'Cross-validation: selected point and neighbours'),
+    ('bench',        'Benchmark'),
+]
+
+# Value that means "keep what the plugin draws" (also the type of each property)
+PLOT_STYLE_DEFAULTS = {
+    'font_family': '', 'title_size': 0.0, 'label_size': 0.0, 'tick_size': 0.0, 'legend_size': 0.0,
+    'title_weight': '', 'label_weight': '',
+    'title': '', 'xlabel': '', 'ylabel': '', 'zlabel': '',
+    'x_decimals': -1, 'y_decimals': -1, 'z_decimals': -1,
+    'tick_dir': '', 'tick_len': 0.0, 'spine_width': 0.0, 'hide_top_right': '',
+    'grid': '', 'grid_style': '', 'grid_width': 0.0,
+    'line_scale': 1.0, 'marker_scale': 1.0,
+    'legend_show': '', 'legend_loc': '', 'legend_frame': '',
+    'fig_bg': '', 'ax_bg': '',
+    'xmin': '', 'xmax': '', 'ymin': '', 'ymax': '',
+}
+# properties that belong to one particular plot (not copied by "Copy to all plots")
+PLOT_STYLE_SPECIFIC = ('title', 'xlabel', 'ylabel', 'zlabel', 'xmin', 'xmax', 'ymin', 'ymax')
+_FONT_SIZE_FIELDS = ('title_size', 'label_size', 'tick_size', 'legend_size')
+# figures whose layout is managed by the plugin itself (no tight_layout after styling)
+_NO_RELAYOUT = ('cross_neighb', 'vario_map_3d')
+
+_WEIGHTS = [('Default', ''), ('Normal', 'normal'), ('Bold', 'bold')]
+PLOT_STYLE_UI = [
+    ('Font', [
+        ('font_family', 'Font family', 'font', None),
+        ('title_size', 'Title size (pt)', 'size', None),
+        ('label_size', 'Axis label size (pt)', 'size', None),
+        ('tick_size', 'Tick label size (pt)', 'size', None),
+        ('legend_size', 'Legend size (pt)', 'size', None),
+        ('title_weight', 'Title weight', 'choice', _WEIGHTS),
+        ('label_weight', 'Axis label weight', 'choice', _WEIGHTS),
+    ]),
+    ('Texts (main axes; empty = keep the plugin text)', [
+        ('title', 'Title', 'text', None),
+        ('xlabel', 'X axis label', 'text', None),
+        ('ylabel', 'Y axis label', 'text', None),
+        ('zlabel', 'Z axis label (3D)', 'text', None),
+    ]),
+    ('Axes and ticks', [
+        ('x_decimals', 'X tick decimals', 'dec', None),
+        ('y_decimals', 'Y tick decimals', 'dec', None),
+        ('z_decimals', 'Z tick decimals (3D)', 'dec', None),
+        ('tick_dir', 'Tick direction', 'choice',
+         [('Default', ''), ('Out', 'out'), ('In', 'in'), ('In and out', 'inout')]),
+        ('tick_len', 'Tick length (pt)', 'width', None),
+        ('spine_width', 'Axes frame line width (pt)', 'width', None),
+        ('hide_top_right', 'Hide top and right frame', 'choice',
+         [('Default', ''), ('Yes', 'yes'), ('No', 'no')]),
+    ]),
+    ('Grid', [
+        ('grid', 'Grid', 'choice', [('Default', ''), ('Show', 'on'), ('Hide', 'off')]),
+        ('grid_style', 'Grid line style', 'choice',
+         [('Default', ''), ('Solid', '-'), ('Dashed', '--'), ('Dotted', ':'), ('Dash-dot', '-.')]),
+        ('grid_width', 'Grid line width (pt)', 'width', None),
+    ]),
+    ('Lines and markers', [
+        ('line_scale', 'Line width (x original)', 'scale', None),
+        ('marker_scale', 'Marker size (x original)', 'scale', None),
+    ]),
+    ('Legend', [
+        ('legend_show', 'Legend', 'choice', [('Default', ''), ('Show', 'show'), ('Hide', 'hide')]),
+        ('legend_loc', 'Legend position', 'choice',
+         [('Default', ''), ('Best', 'best'), ('Upper right', 'upper right'), ('Upper left', 'upper left'),
+          ('Lower left', 'lower left'), ('Lower right', 'lower right'), ('Right', 'right'),
+          ('Center left', 'center left'), ('Center right', 'center right'),
+          ('Lower center', 'lower center'), ('Upper center', 'upper center'), ('Center', 'center')]),
+        ('legend_frame', 'Legend frame', 'choice', [('Default', ''), ('Show', 'on'), ('Hide', 'off')]),
+    ]),
+    ('Colours', [
+        ('fig_bg', 'Figure background', 'color', None),
+        ('ax_bg', 'Axes background', 'color', None),
+    ]),
+    ('Axis limits (main axes; empty = automatic)', [
+        ('xmin', 'X min', 'num', None), ('xmax', 'X max', 'num', None),
+        ('ymin', 'Y min', 'num', None), ('ymax', 'Y max', 'num', None),
+    ]),
+]
+
+
+class PlotStyleManager:
+    """Holds the style overrides of every plot and keeps them in a JSON file."""
+
+    def __init__(self, path=None):
+        self.path = path or self.default_path()
+        self.styles = {}
+        self.load()
+
+    @staticmethod
+    def default_path():
+        base = None
+        try:
+            from qgis.core import QgsApplication
+            base = QgsApplication.qgisSettingsDirPath()
+            if not isinstance(base, str) or not base:
+                base = None
+        except Exception:
+            base = None
+        if base is None:
+            base = os.path.join(os.path.expanduser('~'), '.geostatisticslab')
+        return os.path.join(base, 'GeostatisticsLab', 'plot_settings.json')
+
+    @staticmethod
+    def _clean(d):
+        """Keep only known properties with the right type that differ from the default."""
+        out = {}
+        for k, v in (d or {}).items():
+            if k not in PLOT_STYLE_DEFAULTS:
+                continue
+            dv = PLOT_STYLE_DEFAULTS[k]
+            try:
+                v = type(dv)(v)
+            except (TypeError, ValueError):
+                continue
+            if k in _FONT_SIZE_FIELDS and not (4.0 <= v <= 72.0):
+                continue            # an implausible size (e.g. 0.5 pt) is ignored: the plot keeps its default
+            if v != dv:
+                out[k] = v
+        return out
+
+    def get(self, key):
+        return dict(self.styles.get(key, {}))
+
+    def set(self, key, values):
+        clean = self._clean(values)
+        if clean:
+            self.styles[key] = clean
+        else:
+            self.styles.pop(key, None)
+
+    def reset(self, key=None):
+        if key is None:
+            self.styles.clear()
+        else:
+            self.styles.pop(key, None)
+
+    def _read(self, path):
+        with open(path, 'r', encoding='utf-8') as fh:
+            data = json.load(fh)
+        plots = data.get('plots', {}) if isinstance(data, dict) else {}
+        valid = {k for k, _ in PLOT_REGISTRY}
+        return {k: self._clean(v) for k, v in plots.items() if k in valid and self._clean(v)}
+
+    def load(self, path=None):
+        try:
+            self.styles = self._read(path or self.path)
+            return True
+        except Exception:
+            self.styles = {}
+            return False
+
+    def save(self, path=None):
+        path = path or self.path
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, 'w', encoding='utf-8') as fh:
+                json.dump({'version': 1, 'plots': self.styles}, fh, indent=2, sort_keys=True)
+            return True
+        except Exception:
+            return False
+
+
+def _same(a, b):
+    if a is b:
+        return True
+    try:
+        return bool(np.all(a == b))
+    except Exception:
+        return False
+
+
+def _track(obj, key, getter, setter, override=None, fn=None):
+    """Apply `override` (or fn(original)) to a property, remembering its original value.
+
+    If the property is not overridden the original value is put back. If the plugin
+    changed the property in the meantime, the new value becomes the original one.
+    """
+    try:
+        cur = getter()
+    except Exception:
+        return
+    if cur is None:
+        return
+    store = obj.__dict__.setdefault('_gsl_track', {})
+    rec = store.get(key)
+    if rec is None:
+        rec = {'orig': cur, 'applied': cur}
+    elif not _same(cur, rec['applied']):
+        rec['orig'] = cur
+    try:
+        new = fn(rec['orig']) if fn is not None else (override if override is not None else rec['orig'])
+    except Exception:
+        new = rec['orig']
+    if not _same(new, cur):
+        try:
+            setter(new)
+        except Exception:
+            pass
+    try:
+        rec['applied'] = getter()
+    except Exception:
+        rec['applied'] = cur
+    store[key] = rec
+
+
+_FMT_CACHE = {}
+
+
+def _decimals_formatter(n):
+    if n not in _FMT_CACHE:
+        _FMT_CACHE[n] = _FormatStrFormatter('%.' + str(int(n)) + 'f')
+    return _FMT_CACHE[n]
+
+
+def _rgba(value):
+    try:
+        return _mcolors.to_rgba(value) if value else None
+    except Exception:
+        return None
+
+
+def _num(value):
+    try:
+        return float(str(value).replace(',', '.')) if str(value).strip() else None
+    except ValueError:
+        return None
+
+
+def _style_text(t, family, size, weight, text=None, track_text=False):
+    if t is None:
+        return
+    _track(t, 'size', t.get_fontsize, t.set_fontsize, size)
+    _track(t, 'family', t.get_fontfamily, t.set_fontfamily, family)
+    _track(t, 'weight', t.get_fontweight, t.set_fontweight, weight)
+    if track_text or text is not None:
+        _track(t, 'text', t.get_text, t.set_text, text)
+
+
+def apply_plot_style(fig, style, key=''):
+    """Apply the style dictionary of one plot to its matplotlib figure."""
+    style = style or {}
+    D = PLOT_STYLE_DEFAULTS
+
+    def g(k):
+        return style.get(k, D[k])
+
+    def nz(k):                      # numeric property -> None when "default"
+        v = g(k)
+        return v if v else None
+
+    fam = [g('font_family')] if g('font_family') else None
+    tsize, lsize, ksize, gsize = nz('title_size'), nz('label_size'), nz('tick_size'), nz('legend_size')
+    tw, lw_ = (g('title_weight') or None), (g('label_weight') or None)
+    axes = list(fig.axes)
+    main = [a for a in axes if a.get_label() != '<colorbar>']
+    first = main[0] if main else None
+
+    # ---- figure ------------------------------------------------------------
+    _track(fig, 'bg', fig.get_facecolor, fig.set_facecolor, _rgba(g('fig_bg')))
+
+    for ax in axes:
+        is_cb = ax.get_label() == '<colorbar>'
+        is3d = hasattr(ax, 'zaxis')
+        is_first = ax is first
+        names = ('x', 'y', 'z') if is3d else ('x', 'y')
+
+        # ---- title and axis labels --------------------------------------------
+        _style_text(ax.title, fam, tsize, tw, (g('title') or None) if is_first else None, True)
+        for nm in names:
+            axis = getattr(ax, nm + 'axis')
+            txt = g(nm + 'label') if (is_first and not is_cb) else ''
+            _style_text(axis.label, fam, lsize, lw_, txt or None, True)
+
+        # ---- ticks ----------------------------------------------------------------
+        for nm in names:
+            axis = getattr(ax, nm + 'axis')
+            kw = getattr(axis, '_major_tick_kw', {})
+
+            def _ticksize(axis=axis):
+                tk = axis.get_major_ticks()
+                return tk[0].label1.get_fontsize() if tk else None
+            _track(axis, 'ticksize', _ticksize,
+                   lambda v, nm=nm: ax.tick_params(axis=nm, labelsize=v), ksize)
+            dec = g(nm + '_decimals')
+            if not (is_cb and nm == 'x'):
+                _track(axis, 'fmt', axis.get_major_formatter, axis.set_major_formatter,
+                       _decimals_formatter(dec) if dec >= 0 else None)
+            if g('tick_dir') or 'tickdir' in kw or '_gsl_track' in axis.__dict__:
+                _track(axis, 'tickdir', lambda kw=kw: kw.get('tickdir', _mpl.rcParams[nm + 'tick.direction']),
+                       lambda v, nm=nm: ax.tick_params(axis=nm, direction=v), g('tick_dir') or None)
+            if g('tick_len') or 'size' in kw or '_gsl_track' in axis.__dict__:
+                _track(axis, 'ticklen', lambda kw=kw: kw.get('size', _mpl.rcParams[nm + 'tick.major.size']),
+                       lambda v, nm=nm: ax.tick_params(axis=nm, length=v), nz('tick_len'))
+            if fam is not None or '_gsl_fam' in axis.__dict__:
+                for lab in axis.get_ticklabels():
+                    _track(lab, 'family', lab.get_fontfamily, lab.set_fontfamily, fam)
+                axis.__dict__['_gsl_fam'] = True
+
+        if is_cb:
+            continue
+
+        # ---- frame --------------------------------------------------------------------
+        if not is3d:
+            for sp in ax.spines.values():
+                _track(sp, 'lw', sp.get_linewidth, sp.set_linewidth, nz('spine_width'))
+            if is_first:
+                hide = g('hide_top_right')
+                for name in ('top', 'right'):
+                    sp = ax.spines[name]
+                    _track(sp, 'vis', sp.get_visible, sp.set_visible,
+                           False if hide == 'yes' else (True if hide == 'no' else None))
+            _track(ax, 'facecolor', ax.get_facecolor, ax.set_facecolor, _rgba(g('ax_bg')))
+
+            # ---- grid --------------------------------------------------------------------
+            def _grid_on():
+                gl = ax.xaxis.get_gridlines()
+                return bool(gl and gl[0].get_visible())
+            gmode = g('grid')
+            _track(ax, 'grid', _grid_on, lambda v: ax.grid(v),
+                   True if gmode == 'on' else (False if gmode == 'off' else None))
+            if _grid_on():
+                _track(ax, 'gstyle', lambda: ax.xaxis.get_gridlines()[0].get_linestyle(),
+                       lambda v: ax.grid(True, linestyle=v), g('grid_style') or None)
+                _track(ax, 'gwidth', lambda: ax.xaxis.get_gridlines()[0].get_linewidth(),
+                       lambda v: ax.grid(True, linewidth=v), nz('grid_width'))
+
+        # ---- lines and markers ------------------------------------------------------
+        ls, ms = g('line_scale'), g('marker_scale')
+        for ln in ax.lines:
+            _track(ln, 'lw', ln.get_linewidth, ln.set_linewidth, None,
+                   (lambda o: o * ls) if ls != 1.0 else None)
+            _track(ln, 'ms', ln.get_markersize, ln.set_markersize, None,
+                   (lambda o: o * ms) if ms != 1.0 else None)
+        for col in ax.collections:
+            if isinstance(col, _PathCollection):
+                _track(col, 'sizes', lambda c=col: np.array(c.get_sizes(), float),
+                       lambda v, c=col: c.set_sizes(v), None,
+                       (lambda o: o * ms) if ms != 1.0 else None)
+
+        # ---- legend -------------------------------------------------------------------
+        leg = ax.get_legend()
+        if leg is not None:
+            for t in leg.get_texts():
+                _style_text(t, fam, gsize, None)
+            _style_text(leg.get_title(), fam, gsize, None)
+            show = g('legend_show')
+            _track(leg, 'vis', leg.get_visible, leg.set_visible,
+                   True if show == 'show' else (False if show == 'hide' else None))
+            fr = g('legend_frame')
+            _track(leg, 'frame', leg.get_frame_on, leg.set_frame_on,
+                   True if fr == 'on' else (False if fr == 'off' else None))
+            code = _Legend.codes.get(g('legend_loc')) if g('legend_loc') else None
+            _track(leg, 'loc', lambda: leg._loc, lambda v: leg.set_loc(v), code)
+
+        # ---- axis limits (main axes only) ------------------------------------------
+        if is_first:
+            for nm, (lo, hi) in (('x', ('xmin', 'xmax')), ('y', ('ymin', 'ymax'))):
+                vlo, vhi = _num(g(lo)), _num(g(hi))
+                fn = None
+                if vlo is not None or vhi is not None:
+                    fn = (lambda o, vlo=vlo, vhi=vhi:
+                          (o[0] if vlo is None else vlo, o[1] if vhi is None else vhi))
+                _track(ax, nm + 'lim', getattr(ax, 'get_%slim' % nm), getattr(ax, 'set_%slim' % nm), None, fn)
+
+
+# Sizes used by the plugin when it draws a plot (used to show the default value in the Settings tab
+# before the plot has been drawn; afterwards the real values read from the figure are used)
+PLOT_STATIC_DEFAULTS = {
+    'qqplot':       dict(title_size=9, label_size=8, tick_size=7),
+    'decluster':    dict(title_size=10, label_size=8, tick_size=7, legend_size=7),
+    'vario':        dict(legend_size=8),
+    'vario_map':    dict(title_size=10, label_size=8, tick_size=7),
+    'vario_map_3d': dict(title_size=10, label_size=8, tick_size=7),
+    'cross':        dict(title_size=10, label_size=9, legend_size=8),
+    'cross_map':    dict(title_size=10, label_size=8, tick_size=7, legend_size=7),
+    'cross_neighb': dict(title_size=10, label_size=8, tick_size=7, legend_size=7),
+}
+
+
+def plot_native_values(fig, key=''):
+    """Values of the properties as drawn by the plugin (before any user style)."""
+    from matplotlib.font_manager import FontProperties
+    rc = _mpl.rcParams
+
+    def pts(v):
+        return float(FontProperties(size=v).get_size_in_points())
+    out = {'title_size': pts(rc['axes.titlesize']), 'label_size': pts(rc['axes.labelsize']),
+           'tick_size': pts(rc['xtick.labelsize']), 'legend_size': pts(rc['legend.fontsize']),
+           'tick_len': float(rc['xtick.major.size']), 'spine_width': float(rc['axes.linewidth']),
+           'grid_width': float(rc['grid.linewidth']), 'tick_dir': rc['xtick.direction'], 'grid': bool(rc['axes.grid'])}
+    out.update({k: float(v) for k, v in PLOT_STATIC_DEFAULTS.get(key, {}).items()})
+    axes = [a for a in fig.axes if a.get_label() != '<colorbar>']
+    if not axes:
+        return out
+    ax = axes[0]
+
+    def orig(obj, k, getter):
+        rec = obj.__dict__.get('_gsl_track', {}).get(k)
+        try:
+            return rec['orig'] if rec else getter()
+        except Exception:
+            return None
+
+    def first_tick():
+        tk = ax.xaxis.get_major_ticks()
+        return tk[0].label1.get_fontsize() if tk else None
+    kw = getattr(ax.xaxis, '_major_tick_kw', {})
+    legs = ax.get_legend()
+    found = {
+        'title_size': orig(ax.title, 'size', ax.title.get_fontsize),
+        'label_size': orig(ax.xaxis.label, 'size', ax.xaxis.label.get_fontsize),
+        'tick_size': orig(ax.xaxis, 'ticksize', first_tick),
+        'legend_size': (orig(legs.get_texts()[0], 'size', legs.get_texts()[0].get_fontsize)
+                        if legs is not None and legs.get_texts() else None),
+        'tick_len': orig(ax.xaxis, 'ticklen', lambda: kw.get('size')),
+        'tick_dir': orig(ax.xaxis, 'tickdir', lambda: kw.get('tickdir')),
+        'spine_width': orig(ax.spines['left'], 'lw', ax.spines['left'].get_linewidth),
+        'grid_width': orig(ax, 'gwidth', lambda: ax.xaxis.get_gridlines()[0].get_linewidth()),
+        'grid': orig(ax, 'grid', lambda: bool(ax.xaxis.get_gridlines()[0].get_visible())),
+        'xlim': orig(ax, 'xlim', ax.get_xlim), 'ylim': orig(ax, 'ylim', ax.get_ylim),
+    }
+    out.update({k: v for k, v in found.items() if v is not None})
+    return out
+
+
+class StyledCanvas(FigureCanvas):
+    """Matplotlib canvas that applies the user style of its plot before every draw."""
+
+    def __init__(self, figure, key=None, manager=None):
+        super().__init__(figure)
+        self._gsl_key = key
+        self._gsl_manager = manager
+        self.on_drawn = None          # called after every draw (the Settings tab uses it)
+
+    def draw(self):
+        try:
+            fig = self.figure
+            style = self._gsl_manager.get(self._gsl_key) if self._gsl_manager else {}
+            apply_plot_style(fig, style, self._gsl_key)
+            sig = (json.dumps(style, sort_keys=True), tuple(id(a) for a in fig.axes))
+            prev = fig.__dict__.get('_gsl_sig')
+            if sig != prev:
+                fig.__dict__['_gsl_sig'] = sig
+                if (style or (prev and prev[0] != '{}')) and fig.axes and self._gsl_key not in _NO_RELAYOUT:
+                    fig.tight_layout()
+        except Exception:
+            pass        # a styling problem must never prevent the plot from being drawn
+        super().draw()
+        if self.on_drawn is not None:
+            try:
+                self.on_drawn(self._gsl_key)
+            except Exception:
+                pass
+
 
 class GeostatisticsLabDialog(QtWidgets.QDialog, FORM_CLASS):
     def __init__(self, parent=None):
@@ -44,67 +835,94 @@ class GeostatisticsLabDialog(QtWidgets.QDialog, FORM_CLASS):
         # Cache variables to store data for instant replotting
         self.last_lags = None
         self.last_results = None
+        self.last_variogram_normalized = False  # True if the cached gamma(h) was divided by the sample variance
         self.last_layer_id = None
         self.last_field_name = None
         self.last_stats_values = None  # Cache for statistics data points
         self.variogram_computed = False # Flag to track if user computed/fitted a real model
+        self.last_variogram_time_s = None  # Elapsed seconds of the last experimental variogram run
+        self.last_kriging_time_s = None    # Elapsed seconds of the last kriging run
+        self.last_cross_kriging_time_s = None  # Elapsed seconds of the last cross-kriging run
+        self.last_autofit_time_s = None  # Elapsed seconds of the last variogram autofit
+        self.last_autovar_result = None  # Result dict of the last AutoVar run
+        self.last_autovar_time_s = None  # Elapsed seconds of the last AutoVar run
+        self.last_benchmark_vrg = []  # rows (layer, n_points, t_1dir, t_2dir, t_4dir) of the Benchmark tab
+        self.last_benchmark_krig = [] # rows (test, n_nodes, time) of the kriging benchmark
+        self._bench_mode = 'vrg'      # what table/plot of the Benchmark tab show: 'vrg', 'krig' or 'opt'
+        self.last_benchmark_opt = []  # rows (n_start, min, max, mean SSE, n_valid_runs, n_runs) of the optimisation benchmark
+        self._opt_bench_running = False
+        self._opt_bench_stop = False
+        self._opt_bench_runs = 0
+
+        # User style of the plots (Settings tab), loaded from the settings file of the previous session
+        self.plot_styles = PlotStyleManager()
+        self._plot_canvases = {}
 
         # ---------------------------------------------------------
         # 1. Setup Canvases for Matplotlib Plots
         # ---------------------------------------------------------
         # Histogram Canvas (Tab 1)
         self.figure_histo = Figure()
-        self.canvas_histo = FigureCanvas(self.figure_histo)
+        self.canvas_histo = self._make_canvas(self.figure_histo, 'histo')
         layout_histo = QtWidgets.QVBoxLayout(self.plotWidgetHisto)
         layout_histo.addWidget(self.canvas_histo)
 
         # Variogram Canvas (Tab 2)
         self.figure_vario = Figure()
-        self.canvas_vario = FigureCanvas(self.figure_vario)
+        self.canvas_vario = self._make_canvas(self.figure_vario, 'vario')
         layout_vario = QtWidgets.QVBoxLayout(self.plotWidgetVariogram)
         layout_vario.addWidget(self.canvas_vario)
 
         # Variogram Map Canvas
         self.figure_vario_map = Figure()
-        self.canvas_vario_map = FigureCanvas(self.figure_vario_map)
+        self.canvas_vario_map = self._make_canvas(self.figure_vario_map, 'vario_map')
         layout_vario_map = QtWidgets.QVBoxLayout(self.plotWidgetVariogram_map)
         layout_vario_map.addWidget(self.canvas_vario_map)
 
         # Variogram Map 3D Canvas
         self.figure_vario_map_3d = Figure()
-        self.canvas_vario_map_3d = FigureCanvas(self.figure_vario_map_3d)
+        self.canvas_vario_map_3d = self._make_canvas(self.figure_vario_map_3d, 'vario_map_3d')
         layout_vario_map_3d = QtWidgets.QVBoxLayout(self.plotWidgetVariogram_map_3D)
         layout_vario_map_3d.addWidget(self.canvas_vario_map_3d)
 
         # Q-Q Plot Canvas (normality check, original vs NS-transformed)
         self.figure_qqplot = Figure()
-        self.canvas_qqplot = FigureCanvas(self.figure_qqplot)
+        self.canvas_qqplot = self._make_canvas(self.figure_qqplot, 'qqplot')
         layout_qqplot = QtWidgets.QVBoxLayout(self.plotWidget_qqplot)
         layout_qqplot.addWidget(self.canvas_qqplot)
 
         # Declustering Canvas (weighted mean vs cell size)
         self.figure_decluster = Figure()
-        self.canvas_decluster = FigureCanvas(self.figure_decluster)
+        self.canvas_decluster = self._make_canvas(self.figure_decluster, 'decluster')
         layout_decluster = QtWidgets.QVBoxLayout(self.plotWidget_decluster)
         layout_decluster.addWidget(self.canvas_decluster)
 
         # Cross-Validation Scatter Plot Canvas (Cross Kriging Tab)
         self.figure_cross = Figure()
-        self.canvas_cross = FigureCanvas(self.figure_cross)
+        self.canvas_cross = self._make_canvas(self.figure_cross, 'cross')
         layout_cross = QtWidgets.QVBoxLayout(self.plotWidget_cross_kriging_plot)
         layout_cross.addWidget(self.canvas_cross)
 
         # -- Cross-Validation Map Canvas --
         self.figure_cross_map = Figure()
-        self.canvas_cross_map = FigureCanvas(self.figure_cross_map)
+        self.canvas_cross_map = self._make_canvas(self.figure_cross_map, 'cross_map')
         layout_cross_map = QtWidgets.QVBoxLayout(self.plotWidget_cross_kriging_map)
         layout_cross_map.addWidget(self.canvas_cross_map)
 
+        # Benchmark tab: computing time of the variogram vs number of points
+        self.figure_bench_vrg = Figure()
+        self.canvas_bench_vrg = self._make_canvas(self.figure_bench_vrg, 'bench')
+        layout_bench_vrg = QtWidgets.QVBoxLayout(self.plotWidgetVariogram_benchmark)
+        layout_bench_vrg.addWidget(self.canvas_bench_vrg)
+
         # -- Cross-Validation Neighbor Map Canvas (selected point + neighbors) --
         self.figure_cross_neighb = Figure()
-        self.canvas_cross_neighb = FigureCanvas(self.figure_cross_neighb)
+        self.canvas_cross_neighb = self._make_canvas(self.figure_cross_neighb, 'cross_neighb')
         layout_cross_neighb = QtWidgets.QVBoxLayout(self.plotWidget_cross_kriging_map_neighb)
         layout_cross_neighb.addWidget(self.canvas_cross_neighb)
+
+        # Settings tab: customisation of the plots
+        self._setup_plot_settings_tab()
 
         # -- Autofit model selection table -------------------------------------
         # Populate tableWidget_var_fit_setting with all available variogram
@@ -159,6 +977,9 @@ class GeostatisticsLabDialog(QtWidgets.QDialog, FORM_CLASS):
         self.checkBox_show_counts.setChecked(True)
         self.checkBox_boxplot.setChecked(False)
         self.checkBox_h_boxplot.setChecked(False)
+        # Autofit weights each experimental point by its number of pairs unless
+        # the user unchecks this box (that was the behaviour before the option existed).
+        self.chBox_autofit_n_pairs.setChecked(True)
 
         if hasattr(self, 'checkBox_cum_hist'):
             self.checkBox_cum_hist.setChecked(False)
@@ -170,6 +991,7 @@ class GeostatisticsLabDialog(QtWidgets.QDialog, FORM_CLASS):
         # Initialize Progress Bars
         self.progressBar_vario.setValue(0)
         self.progressBar_kriging.setValue(0)
+        self.progressBarCrossKriging.setValue(0)  # cross-kriging has its own bar
         self.progressBar_autofit.setValue(0)
         self.progressBar_vario_variogram_map.setValue(0)
         self.progressBar_decluster.setValue(0)
@@ -272,6 +1094,12 @@ class GeostatisticsLabDialog(QtWidgets.QDialog, FORM_CLASS):
 
         # -- Declustering connections --
         self.pushButton_decluster.clicked.connect(self.run_declustering)
+        if hasattr(self, 'radioButton_auto_declustering'):
+            self.radioButton_auto_declustering.toggled.connect(self._on_decluster_mode_toggled)
+        if hasattr(self, 'radioButton_manual_declustering'):
+            self.radioButton_manual_declustering.toggled.connect(self._on_decluster_mode_toggled)
+        # Apply initial state (default: auto mode)
+        self._on_decluster_mode_toggled()
         self.mMapLayerComboBox.layerChanged.connect(self._populate_qqplot_ns_field_combo)
         self.pushButton_kriging.clicked.connect(self.run_kriging_interpolation)
         self.pushButton_cross_kriging.clicked.connect(self.run_cross_validation)
@@ -292,11 +1120,38 @@ class GeostatisticsLabDialog(QtWidgets.QDialog, FORM_CLASS):
         # Connect Autofit button component
         self.pushButton_autofit.clicked.connect(self.run_autofit)
 
+        # AutoVar: automatic variogram in the two principal directions
+        self.pushButton_runAutoVar.clicked.connect(self.run_autovar)
+
         # Connect GSLIB Model Export action button
         if hasattr(self, 'pushButton_export_vrg_model'):
             self.pushButton_export_vrg_model.clicked.connect(self.export_gslib_model)
         if hasattr(self, 'pushButton_export_variogram_to_png'):
             self.pushButton_export_variogram_to_png.clicked.connect(self.export_variogram_to_png)
+        # Experimental variogram -> CSV (no hasattr guard on purpose: a wrong
+        # widget name in the .ui file must fail loudly at start-up).
+        self.pushBtnExportVrg_to_csv.clicked.connect(self.export_variogram_to_csv)
+        # Cross-kriging results table -> CSV (same rule: no hasattr guard).
+        self.pushBtnCrossKriging_to_csv.clicked.connect(self.export_cross_kriging_to_csv)
+        # Benchmark tab (no hasattr guards: a wrong widget name must fail loudly)
+        self._setup_benchmark_vrg_table()
+        self.progressBar_bench_vrg.setRange(0, 100)
+        self.progressBar_bench_vrg.setValue(0)
+        # Hardware/software description for the publication (refreshed before each benchmark)
+        self._update_hardware_info()
+        self.pushButtonBenchVrg.clicked.connect(self._update_hardware_info)
+        self.pushButtonKriginBenchmark.clicked.connect(self._update_hardware_info)
+        self.pushButton_opt_bench.clicked.connect(self._update_hardware_info)
+        self.pushButtonBenchVrg.clicked.connect(self.run_benchmark_variogram)
+        self.pushBtn_exportBenchmarkVrg_csv.clicked.connect(self.export_benchmark_vrg_to_csv)
+        self.vrg_benchmark_export_to_png.clicked.connect(self.export_benchmark_vrg_to_png)
+        self.progressBar_krige_test.setRange(0, 100)
+        self.progressBar_krige_test.setValue(0)
+        self.pushButtonKriginBenchmark.clicked.connect(self.run_kriging_benchmark)
+        self.pushButton_opt_bench.clicked.connect(self.run_opt_benchmark)
+        # Kriging parameter file (.kriging_par)
+        self.pushButton_save_kriging_par.clicked.connect(self.save_kriging_par)
+        self.pushButton_load_kriging_par.clicked.connect(self.load_kriging_par)
         if hasattr(self, 'pushButton_export_variogram_map_to_png'):
             self.pushButton_export_variogram_map_to_png.clicked.connect(self.export_variogram_map_to_png)
         if hasattr(self, 'pushButton_export_Cross_kriging_plot_to_png'):
@@ -355,6 +1210,11 @@ class GeostatisticsLabDialog(QtWidgets.QDialog, FORM_CLASS):
         self._on_estim_target_toggled()
         self._populate_probability_raster_combos()
         self._populate_qqplot_ns_field_combo()
+
+        # Every progress bar starts empty (the .ui files keep the designer's test value)
+        for _pb in self.findChildren(QtWidgets.QProgressBar):
+            _pb.setRange(0, 100)
+            _pb.setValue(0)
 
     def setup_model_table(self):
         """Configures columns and inserts professional cell-widgets for nested variogram structures."""
@@ -480,6 +1340,42 @@ class GeostatisticsLabDialog(QtWidgets.QDialog, FORM_CLASS):
 
         tw.resizeColumnsToContents()
 
+    @staticmethod
+    def _autofit_start_ranges(k, n_spatial, family, max_h):
+        """Starting (major, minor) range of the k-th of n_spatial spatial structures.
+
+        One structure: 0.5 and 0.3 of the largest lag distance, as always. Several
+        structures: the major ranges are spaced geometrically between 0.15 and 0.9 of
+        that distance, so that no two structures start equal. Family 0 starts with the
+        shortest structure isotropic and the others anisotropic (minor range half of
+        the major one); family 1 with all the structures anisotropic."""
+        if n_spatial <= 1:
+            return max_h * 0.5, max_h * 0.3
+        f = 0.15 * (0.9 / 0.15) ** (k / float(n_spatial - 1))
+        ratio = 1.0 if (family == 0 and k == 0) else 0.5
+        return f * max_h, f * max_h * ratio
+
+    @staticmethod
+    def _sort_autofit_structures(types, params):
+        """Reorder the parameters of the spatial structures by increasing major range
+        (nuggets first). All the spatial structures of a candidate are of the same
+        model, so the blocks of 4 parameters can be exchanged freely."""
+        params = list(np.asarray(params, dtype=float))
+        nug, blocks, idx = [], [], 0
+        for t in types:
+            if t == "Nugget":
+                nug.append(params[idx]); idx += 1
+            else:
+                blocks.append(params[idx:idx + 4]); idx += 4
+        blocks.sort(key=lambda b: b[1])
+        out, ni, bi = [], 0, 0
+        for t in types:
+            if t == "Nugget":
+                out.append(nug[ni]); ni += 1
+            else:
+                out.extend(blocks[bi]); bi += 1
+        return np.array(out)
+
     def _get_enabled_autofit_models(self):
         """Return the list of model names whose checkbox is currently checked."""
         tw = self.tableWidget_var_fit_setting
@@ -549,6 +1445,7 @@ class GeostatisticsLabDialog(QtWidgets.QDialog, FORM_CLASS):
         results = self.last_results
         
         all_h, all_az, all_gamma, all_weights = [], [], [], []
+        all_pair_dist = []  # mean separation of the pairs actually in each bin
         for az, (gamma, counts, _, h_eff, _pd) in results.items():
             for k in range(len(lags)):
                 if not np.isnan(gamma[k]) and counts[k] > 0:
@@ -556,11 +1453,13 @@ class GeostatisticsLabDialog(QtWidgets.QDialog, FORM_CLASS):
                     all_az.append(az)
                     all_gamma.append(gamma[k])
                     all_weights.append(counts[k])
+                    all_pair_dist.append(float(np.mean(_pd[k])))
                     
         if len(all_gamma) == 0:
             return
 
         all_h, all_az, all_gamma, all_weights = np.array(all_h), np.array(all_az), np.array(all_gamma), np.array(all_weights)
+        all_pair_dist = np.array(all_pair_dist)
         max_h = np.max(all_h)
 
         if max_h <= 0 or sample_variance <= 0:
@@ -571,6 +1470,63 @@ class GeostatisticsLabDialog(QtWidgets.QDialog, FORM_CLASS):
                 "lag/distance settings."
             )
             return
+
+        # If the experimental variogram was normalised (gamma(h) divided by the sample
+        # variance, checkBox_Normalize_by_variance), its values are of the order of 1
+        # and its sill tends to 1. The starting values, the bounds of the sills and the
+        # scale of the objective below are all expressed in units of the "sample
+        # variance": they must then refer to the scale of the data being fitted, i.e. 1,
+        # and not to the variance of the raw values (e.g. 1e4), otherwise the optimiser
+        # starts and is bounded on a scale that is wrong by orders of magnitude and the
+        # model is not fitted. The model found is in the same (normalised) units as
+        # the experimental variogram shown in the plot.
+        if getattr(self, 'last_variogram_normalized', False):
+            sample_variance = 1.0
+
+        # -- Weights of the experimental points in the least-squares objective ----
+        # Two independent options build the weight w_j of each experimental point:
+        #
+        #  1) chBox_autofit_n_pairs  ->  base weight b_j
+        #       checked   : b_j = N_j, the number of pairs in the bin (the original
+        #                   behaviour)
+        #       unchecked : every point gets the SAME weight. The constant is the
+        #                   mean pair count, not 1: the minimiser only cares about
+        #                   relative weights, but this keeps the scale of the
+        #                   objective (and so the optimiser's stopping behaviour)
+        #                   identical to the checked case.
+        #
+        #  2) checkBox_vrg_weight    ->  distance weighting
+        #       unchecked : w_j = b_j
+        #       checked   : w_j = b_j / d_j**a          a = doubleSpinBox_exp_weght
+        #                   so that points at short distance count more: a = 1 gives
+        #                   a mild emphasis, a = 2 the usual N_j / h_j**2 form (with
+        #                   option 1 checked), larger values push the fit further
+        #                   towards the first lags (a = 0 means no distance weighting).
+        #                   With option 1 unchecked this is the pure 1 / d_j**a.
+        #
+        # d_j is the distance at which the point is plotted (h_eff). The first bin
+        # can sit at d = 0 (no pair has zero separation), which would give an
+        # infinite weight, so there the mean separation of the pairs that really
+        # fall in the bin is used instead; a tiny floor keeps d strictly positive.
+        if self.chBox_autofit_n_pairs.isChecked():
+            base_weights = all_weights.astype(float)
+        else:
+            base_weights = np.full(all_weights.shape, float(np.mean(all_weights)))
+        fit_weights = base_weights
+        if self.checkBox_vrg_weight.isChecked():
+            exponent = self.doubleSpinBox_exp_weght.value()
+            weight_dist = np.where(all_h > 0.0, all_h, all_pair_dist)
+            weight_dist = np.maximum(weight_dist, max_h * 1e-6)
+            dist_weighted = base_weights / np.power(weight_dist, exponent)
+            total_w = float(np.sum(dist_weighted))
+            if np.isfinite(total_w) and total_w > 0.0:
+                # Only the RELATIVE weights matter to the minimiser, but a large
+                # exponent on large distances (e.g. coordinates in metres) would
+                # shrink the objective and its gradient by many orders of
+                # magnitude; L-BFGS-B uses an absolute gradient tolerance and
+                # could then stop at the starting point. Rescale so that the sum of
+                # the weights equals the unweighted one (the total number of pairs).
+                fit_weights = dist_weighted * (float(np.sum(all_weights)) / total_w)
 
         # -- Read which models the user has enabled in tableWidget_var_fit_setting
         enabled_models = self._get_enabled_autofit_models()
@@ -609,6 +1565,11 @@ class GeostatisticsLabDialog(QtWidgets.QDialog, FORM_CLASS):
             )
             return
 
+        # Start of the timed section (reported in computing_time_auto_fit_vrg): the
+        # optimisation over all candidate models and starting azimuths. Input checks
+        # and modal dialogs above are excluded; no dialog is shown inside the loop.
+        t_autofit_start = time.perf_counter()
+
         best_sse = float('inf')
         best_params, best_types = None, None
 
@@ -623,6 +1584,9 @@ class GeostatisticsLabDialog(QtWidgets.QDialog, FORM_CLASS):
         # area is very small (e.g. coordinates in km, or a compact dataset),
         # which made x0 fall below its own bound and crashed L-BFGS-B.
         range_floor = max(max_h * 1e-4, 1e-12)
+        # Upper bound of the ranges, in units of the largest lag distance (was 2; raised
+        # tenfold so that very long ranges, e.g. 551 km in AutoVar for SIC97, are reachable)
+        range_ub = 20.0
 
         # Small inward margin so x0 never sits exactly ON a bound. Some
         # scipy/Windows builds evaluate the numerical gradient with a
@@ -642,7 +1606,38 @@ class GeostatisticsLabDialog(QtWidgets.QDialog, FORM_CLASS):
         # the standard fix for this kind of optimizer getting stuck.
         azimuth_starts = [AZIMUTH_EPS, 30.0, 60.0, 90.0, 120.0, 150.0]
         n_angle_starts = len(azimuth_starts)
-        n_total_steps = n_candidates * n_angle_starts
+        # A candidate with several spatial structures is optimised from two different
+        # families of starting ranges (see _autofit_start_ranges), so it needs twice
+        # as many runs; this is only used to scale the progress bar.
+        def _n_families(types):
+            return 2 if sum(1 for t in types if t != "Nugget") > 1 else 1
+        n_total_steps = sum(_n_families(c) * n_angle_starts for c in candidates_set)
+        steps_done = 0
+
+        # -- Normalised optimisation variables (only for the new weighting options) --
+        # L-BFGS-B stops as soon as the projected gradient falls below an ABSOLUTE
+        # tolerance (1e-5) and estimates it by finite differences with an absolute
+        # step (1e-8). With ranges expressed in metres (e.g. UTM coordinates) the
+        # derivative of the objective with respect to a range is tiny, and distance
+        # weights with a large exponent make it tinier still: the optimiser then
+        # stops at the starting point and returns it as if it were a fit, without
+        # any message. Optimising dimensionless variables (sills in units of the
+        # sample variance, ranges in units of max_h, azimuth in units of 180 deg)
+        # and a dimensionless objective removes the dependence on the units.
+        # The original path (pair-count weights, no distance weighting) is kept
+        # exactly as it was, so previously obtained fits do not change.
+        # checkBox_force_sill (checked by default): the total sill of the model (nugget +
+        # sills of the structures) cannot exceed the sample variance, i.e. 1.0 when the
+        # variogram is normalised (sample_variance is already 1 in that case). It is an
+        # inequality constraint, so it needs SLSQP instead of L-BFGS-B; the scaled
+        # problem is used, in which the constraint reads sum(sills) <= 1.
+        force_sill = bool(self.checkBox_force_sill.isChecked()) if hasattr(self, "checkBox_force_sill") else True
+        use_scaled_problem = (force_sill
+                              or self.checkBox_vrg_weight.isChecked()
+                              or not self.chBox_autofit_n_pairs.isChecked())
+        obj_norm = float(np.sum(fit_weights)) * float(sample_variance) ** 2
+        if not (np.isfinite(obj_norm) and obj_norm > 0.0):
+            obj_norm = 1.0
 
         for candidate_num, types in enumerate(candidates_set):
             spatial_count = sum(1 for t in types if t != "Nugget")
@@ -660,10 +1655,25 @@ class GeostatisticsLabDialog(QtWidgets.QDialog, FORM_CLASS):
                         structs.append({'type': comp_type, 'sill': sill, 'r1': r1, 'r2': r2, 'r3': 0, 'a1': a1, 'a2': 0, 'a3': 0})
                         idx += 4
                 sse = 0.0
-                for h, az, g_exp, w in zip(all_h, all_az, all_gamma, all_weights):
+                for h, az, g_exp, w in zip(all_h, all_az, all_gamma, fit_weights):
                     g_theo = self.calculate_theoretical_semivariance(np.array([h]), az, structs)[0]
                     sse += w * ((g_exp - g_theo) ** 2)
                 return sse
+
+            # Unit of each optimisation variable, in the order used by `objective`
+            # (a nugget has one variable, a spatial structure has sill, r1, r2, a1).
+            unit = []
+            for t in types:
+                if t == "Nugget":
+                    unit.append(float(sample_variance))
+                else:
+                    unit.extend([float(sample_variance), float(max_h), float(max_h), 180.0])
+            unit = np.array(unit, dtype=float)
+            # positions of the sills among the variables (nugget: 1 variable, structure: 4)
+            sill_idx, _i = [], 0
+            for t in types:
+                sill_idx.append(_i)
+                _i += 1 if t == "Nugget" else 4
 
             # Try several starting azimuths for this model combination, and
             # keep whichever converges to the lowest SSE. A single starting
@@ -673,15 +1683,26 @@ class GeostatisticsLabDialog(QtWidgets.QDialog, FORM_CLASS):
             candidate_best_sse = float('inf')
             candidate_best_params = None
 
-            for angle_start_num, az_start in enumerate(azimuth_starts):
+            # Starting points: every starting azimuth, combined (candidates with more than
+            # one spatial structure only) with two families of starting ranges. The
+            # structures of one candidate must NOT start from the same values: the
+            # objective is symmetric in them, so with identical starting values the
+            # gradient is identical for all of them and the optimiser moves them
+            # together, ending with identical structures (or with one of them
+            # useless). Different starting ranges (and anisotropy) break the symmetry.
+            starts = [(fam, az0) for fam in range(_n_families(types)) for az0 in azimuth_starts]
+            for angle_start_num, (family, az_start) in enumerate(starts):
                 x0, bounds = [], []
+                k_sp = 0
                 for t in types:
                     if t == "Nugget":
                         x0.append(sample_variance * 0.15 if spatial_count > 0 else sample_variance)
-                        bounds.append((0.0, sample_variance * 2.0))
+                        bounds.append((0.0, sample_variance * (1.0 if force_sill else 2.0)))
                     else:
-                        x0.extend([(sample_variance * 0.85) / spatial_count if has_nugget else sample_variance / spatial_count, max_h * 0.5, max_h * 0.3, az_start])
-                        bounds.extend([(0.0, sample_variance * 2.0), (range_floor, max_h * 2.0), (range_floor, max_h * 2.0), (0.0, 180.0)])
+                        r1_0, r2_0 = self._autofit_start_ranges(k_sp, spatial_count, family, max_h)
+                        k_sp += 1
+                        x0.extend([(sample_variance * 0.85) / spatial_count if has_nugget else sample_variance / spatial_count, r1_0, r2_0, az_start])
+                        bounds.extend([(0.0, sample_variance * (1.0 if force_sill else 2.0)), (range_floor, max_h * range_ub), (range_floor, max_h * range_ub), (0.0, 180.0)])
 
                 # Defensive clamp: guarantee x0 always lies strictly within
                 # its own bounds (not just <=/>=, but with a tiny inward
@@ -705,9 +1726,27 @@ class GeostatisticsLabDialog(QtWidgets.QDialog, FORM_CLASS):
                     safe_bounds.append((lo, hi))
                 x0, bounds = safe_x0, safe_bounds
 
-                step_num = candidate_num * n_angle_starts + angle_start_num
+                step_num = steps_done
+                steps_done += 1
                 try:
-                    res = minimize(objective, x0, method='L-BFGS-B', bounds=bounds)
+                    if use_scaled_problem:
+                        # Same problem in dimensionless variables; the result is
+                        # converted back to the physical units right away.
+                        z_bounds = [(lo / u, hi / u) for (lo, hi), u in zip(bounds, unit)]
+                        if force_sill:
+                            res = minimize(lambda z: objective(z * unit) / obj_norm,
+                                           np.asarray(x0, dtype=float) / unit,
+                                           method='SLSQP', bounds=z_bounds,
+                                           constraints=[{'type': 'ineq',
+                                                         'fun': lambda z, ix=list(sill_idx): 1.0 - float(np.sum(np.asarray(z)[ix]))}])
+                        else:
+                            res = minimize(lambda z: objective(z * unit) / obj_norm,
+                                           np.asarray(x0, dtype=float) / unit,
+                                           method='L-BFGS-B', bounds=z_bounds)
+                        res_x, res_fun = res.x * unit, res.fun * obj_norm
+                    else:
+                        res = minimize(objective, x0, method='L-BFGS-B', bounds=bounds)
+                        res_x, res_fun = res.x, res.fun
                 except ValueError:
                     # Skip this starting angle rather than aborting the
                     # whole candidate; other starting angles can still be
@@ -716,9 +1755,11 @@ class GeostatisticsLabDialog(QtWidgets.QDialog, FORM_CLASS):
                     QtWidgets.QApplication.processEvents()
                     continue
 
-                if res.success and res.fun < candidate_best_sse:
-                    candidate_best_sse = res.fun
-                    candidate_best_params = res.x
+                if force_sill and float(np.sum(np.asarray(res_x)[sill_idx])) > sample_variance * (1.0 + 1e-6):
+                    continue  # constraint violated (SLSQP stopped early)
+                if res.success and res_fun < candidate_best_sse:
+                    candidate_best_sse = res_fun
+                    candidate_best_params = res_x
 
                 self.progressBar_autofit.setValue(int((step_num + 1) / n_total_steps * 100))
                 QtWidgets.QApplication.processEvents()
@@ -730,7 +1771,16 @@ class GeostatisticsLabDialog(QtWidgets.QDialog, FORM_CLASS):
 
         self.progressBar_autofit.setValue(100)
 
+        # End of the timed section: report before the table update below, which can
+        # open a modal warning when no candidate could be fitted.
+        self.last_autofit_time_s = time.perf_counter() - t_autofit_start
+        self.computing_time_auto_fit_vrg.setText(
+            "Computing time: " + self._format_elapsed_time(self.last_autofit_time_s))
+
         if best_params is not None:
+            # Spatial structures in increasing order of their major range (the nugget
+            # stays first): the optimiser does not care about the order.
+            best_params = self._sort_autofit_structures(best_types, best_params)
             self.tableWidget_models.blockSignals(True)
             self.tableWidget_models.setRowCount(0)
             idx = 0
@@ -793,6 +1843,335 @@ class GeostatisticsLabDialog(QtWidgets.QDialog, FORM_CLASS):
                        self.radioButton_adaptive_lag.isChecked())
         self.doubleSpinBox_lag_tolerance.setEnabled(not is_adaptive)
 
+    def _on_decluster_mode_toggled(self, *args):
+        """Enable or disable doubleSpinBox_cell_size based on the selected
+        declustering mode:
+
+        - Auto mode  (radioButton_auto_declustering):
+            The optimal cell size is identified automatically as the minimum
+            of the diagnostic curve. doubleSpinBox_cell_size shows the result
+            but is NOT editable.
+        - Manual mode (radioButton_manual_declustering):
+            The user sets doubleSpinBox_cell_size freely after inspecting
+            the diagnostic curve. The spinbox IS editable.
+        """
+        is_auto = not (hasattr(self, 'radioButton_manual_declustering') and
+                       self.radioButton_manual_declustering.isChecked())
+        if hasattr(self, 'doubleSpinBox_cell_size'):
+            self.doubleSpinBox_cell_size.setEnabled(not is_auto)
+            self.doubleSpinBox_cell_size.setReadOnly(is_auto)
+
+    # ------------------------------------------------------------------
+    # Settings tab: customisation of the plots
+    # ------------------------------------------------------------------
+    def _make_canvas(self, figure, key):
+        """Create the canvas of a plot; it applies the user style of `key` before every draw."""
+        canvas = StyledCanvas(figure, key, self.plot_styles)
+        self._plot_canvases[key] = canvas
+        canvas.on_drawn = self._ps_plot_drawn
+        return canvas
+
+    def _setup_plot_settings_tab(self):
+        """Build, in the 'Settings' tab, the list of plots and the editor of their properties."""
+        tab = getattr(self, 'tab_23', None)
+        if tab is None:                                   # fall back: search the tab by its title
+            for tw in self.findChildren(QtWidgets.QTabWidget):
+                for i in range(tw.count()):
+                    if tw.tabText(i).strip().lower() == 'settings' and tw.widget(i).layout() is None:
+                        tab = tw.widget(i)
+        if tab is None:
+            return
+        self._ps_loading = False
+        self._ps_get, self._ps_set, self._ps_widgets, self._ps_native = {}, {}, {}, {}
+        self._ps_in_change = False
+
+        root = QtWidgets.QHBoxLayout(tab)
+
+        # ---- left: list of the plots ------------------------------------------------
+        left = QtWidgets.QVBoxLayout()
+        left.addWidget(QtWidgets.QLabel("<b>Plots</b>"))
+        self.listWidget_plot_settings = QtWidgets.QListWidget()
+        self.listWidget_plot_settings.setMinimumWidth(230)
+        self.listWidget_plot_settings.setMaximumWidth(300)
+        for key, label in PLOT_REGISTRY:
+            item = QtWidgets.QListWidgetItem(label)
+            item.setData(QtCore.Qt.UserRole, key)
+            self.listWidget_plot_settings.addItem(item)
+        left.addWidget(self.listWidget_plot_settings)
+        self.label_plot_settings_file = QtWidgets.QLabel("Settings file:\n%s" % self.plot_styles.path)
+        self.label_plot_settings_file.setWordWrap(True)
+        self.label_plot_settings_file.setStyleSheet("color: gray; font-size: 8pt;")
+        left.addWidget(self.label_plot_settings_file)
+        root.addLayout(left)
+
+        # ---- right: properties of the selected plot --------------------------------
+        right = QtWidgets.QVBoxLayout()
+        self.label_plot_settings_title = QtWidgets.QLabel()
+        right.addWidget(self.label_plot_settings_title)
+        hint = QtWidgets.QLabel("Properties left on 'Default' are not touched: the plot looks as drawn by the "
+                                "plugin. Changes are applied to the plot immediately and saved automatically.")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: gray;")
+        right.addWidget(hint)
+
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidgetResizable(True)
+        body = QtWidgets.QWidget()
+        body_layout = QtWidgets.QVBoxLayout(body)
+        for group_title, rows in PLOT_STYLE_UI:
+            box = QtWidgets.QGroupBox(group_title)
+            form = QtWidgets.QFormLayout(box)
+            for field, label, kind, extra in rows:
+                widget = self._ps_make_widget(field, kind, extra)
+                form.addRow(label, widget)
+            body_layout.addWidget(box)
+        body_layout.addStretch(1)
+        scroll.setWidget(body)
+        right.addWidget(scroll, 1)
+
+        buttons = QtWidgets.QHBoxLayout()
+        self.pushButton_plot_reset = QtWidgets.QPushButton("Reset this plot")
+        self.pushButton_plot_reset_all = QtWidgets.QPushButton("Reset to default (all plots)")
+        self.pushButton_plot_copy_all = QtWidgets.QPushButton("Copy appearance to all plots")
+        self.pushButton_plot_export = QtWidgets.QPushButton("Export...")
+        self.pushButton_plot_import = QtWidgets.QPushButton("Import...")
+        for b in (self.pushButton_plot_reset, self.pushButton_plot_reset_all, self.pushButton_plot_copy_all):
+            buttons.addWidget(b)
+        buttons.addStretch(1)
+        buttons.addWidget(self.pushButton_plot_export)
+        buttons.addWidget(self.pushButton_plot_import)
+        right.addLayout(buttons)
+        root.addLayout(right, 1)
+
+        self.listWidget_plot_settings.currentRowChanged.connect(self._ps_load_current)
+        self.pushButton_plot_reset.clicked.connect(self._ps_reset_current)
+        self.pushButton_plot_reset_all.clicked.connect(self._ps_reset_all)
+        self.pushButton_plot_copy_all.clicked.connect(self._ps_copy_to_all)
+        self.pushButton_plot_export.clicked.connect(self._ps_export)
+        self.pushButton_plot_import.clicked.connect(self._ps_import)
+        self.listWidget_plot_settings.setCurrentRow(0)
+        # plots that have already been drawn (none at start-up) pick the saved style at their first draw
+
+    def _ps_make_widget(self, field, kind, extra):
+        """Create the editor of one property and register its getter/setter."""
+        D = PLOT_STYLE_DEFAULTS[field]
+        W = QtWidgets
+        if kind == 'font':
+            w = W.QComboBox()
+            w.setEditable(True)
+            w.setInsertPolicy(W.QComboBox.NoInsert)
+            try:
+                from matplotlib import font_manager
+                names = sorted({f.name for f in font_manager.fontManager.ttflist})
+            except Exception:
+                names = ['DejaVu Sans', 'DejaVu Serif', 'Arial', 'Times New Roman']
+            w.addItems(['(default)'] + names)
+            get = lambda: '' if w.currentText() in ('', '(default)') else w.currentText()
+            def set_(v):
+                i = w.findText(v) if v else 0
+                if v and i < 0:
+                    w.addItem(v)
+                    i = w.findText(v)
+                w.setCurrentIndex(i)
+            w.currentIndexChanged.connect(self._ps_changed)
+        elif kind in ('size', 'width'):
+            nd = 1 if kind == 'size' else 2
+            w = W.QDoubleSpinBox()
+            w.setRange(4.0 if kind == 'size' else 0.1, 72.0)
+            w.setDecimals(nd)
+            w.setSingleStep(0.5 if kind == 'size' else 0.1)
+            w.setSuffix(' pt')
+
+            def get(w=w, nd=nd, field=field):
+                # the value of the plugin is stored as 0 ("default"), so it is never forced
+                d = self._ps_native.get(field)
+                return 0.0 if (d is not None and abs(w.value() - d) < 0.5 * 10 ** -nd) else w.value()
+
+            def set_(v, w=w, field=field):
+                w.setValue(v if v else self._ps_native.get(field, 1.0))
+            w.valueChanged.connect(self._ps_changed)
+        elif kind == 'scale':
+            w = W.QDoubleSpinBox()
+            w.setRange(0.1, 10.0)
+            w.setDecimals(2)
+            w.setSingleStep(0.1)
+            w.setValue(1.0)
+            w.setSuffix(' x')
+            get, set_ = w.value, w.setValue
+            w.valueChanged.connect(self._ps_changed)
+        elif kind == 'dec':
+            w = W.QSpinBox()
+            w.setRange(-1, 10)
+            w.setSpecialValueText('Auto (default)')
+            get, set_ = w.value, w.setValue
+            w.valueChanged.connect(self._ps_changed)
+        elif kind == 'choice':
+            w = W.QComboBox()
+            for text, value in extra:
+                w.addItem(text, value)
+            get = lambda: w.currentData() or ''
+            set_ = lambda v: w.setCurrentIndex(max(0, w.findData(v)))
+            w.currentIndexChanged.connect(self._ps_changed)
+        elif kind in ('text', 'num'):
+            w = W.QLineEdit()
+            w.setPlaceholderText('(default)' if kind == 'text' else '(automatic)')
+            if kind == 'num':
+                w.setValidator(QtGui.QRegExpValidator(QtCore.QRegExp(r'^-?\d*[.,]?\d*([eE][-+]?\d+)?$')))
+            get, set_ = w.text, w.setText
+            w.editingFinished.connect(self._ps_changed)
+        elif kind == 'color':
+            w = W.QWidget()
+            lay = W.QHBoxLayout(w)
+            lay.setContentsMargins(0, 0, 0, 0)
+            btn, clr = W.QPushButton('Default'), W.QToolButton()
+            clr.setText('x')
+            clr.setToolTip('Back to default')
+            lay.addWidget(btn)
+            lay.addWidget(clr)
+            lay.addStretch(1)
+            state = {'v': ''}
+            def set_(v):
+                state['v'] = v or ''
+                btn.setText(state['v'] or 'Default')
+                btn.setStyleSheet('background-color: %s;' % state['v'] if state['v'] else '')
+            def pick():
+                col = W.QColorDialog.getColor(QtGui.QColor(state['v'] or '#ffffff'), self, 'Choose a colour')
+                if col.isValid():
+                    set_(col.name())
+                    self._ps_changed()
+            def clear():
+                set_('')
+                self._ps_changed()
+            btn.clicked.connect(pick)
+            clr.clicked.connect(clear)
+            get = lambda: state['v']
+        else:
+            raise ValueError(kind)
+        self._ps_get[field], self._ps_set[field] = get, set_
+        self._ps_widgets[field] = w
+        return w
+
+    def _ps_current_key(self):
+        item = self.listWidget_plot_settings.currentItem()
+        return item.data(QtCore.Qt.UserRole) if item is not None else None
+
+    def _ps_load_current(self, *_):
+        """Show in the editor the saved style of the selected plot."""
+        key = self._ps_current_key()
+        if key is None:
+            return
+        style = self.plot_styles.get(key)
+        self._ps_update_native(key)
+        self._ps_loading = True
+        try:
+            for field, default in PLOT_STYLE_DEFAULTS.items():
+                self._ps_set[field](style.get(field, default))
+        finally:
+            self._ps_loading = False
+        self.label_plot_settings_title.setText("<b>%s</b>" % self.listWidget_plot_settings.currentItem().text())
+
+    def _ps_update_native(self, key):
+        """Read the values the plugin uses for this plot and show them as 'default' in the editor."""
+        canvas = self._plot_canvases.get(key)
+        self._ps_native = plot_native_values(canvas.figure if canvas is not None else Figure(), key)
+        nat = self._ps_native
+        for field in ('title_size', 'label_size', 'tick_size', 'legend_size', 'tick_len', 'spine_width', 'grid_width'):
+            w = self._ps_widgets.get(field)
+            if w is not None and field in nat:
+                w.setSuffix(' pt   (default %s)' % ('%.2f' % nat[field]).rstrip('0').rstrip('.'))
+        for field, text in (('tick_dir', 'Default (%s)' % nat.get('tick_dir', '')),
+                            ('grid', 'Default (%s)' % ('shown' if nat.get('grid') else 'hidden'))):
+            w = self._ps_widgets.get(field)
+            if w is not None:
+                w.setItemText(0, text)
+        for axis, field in (('xlim', 'xmin'), ('xlim', 'xmax'), ('ylim', 'ymin'), ('ylim', 'ymax')):
+            w = self._ps_widgets.get(field)
+            if w is not None and axis in nat:
+                v = nat[axis][0 if field.endswith('min') else 1]
+                w.setPlaceholderText('(automatic: %.6g)' % v)
+
+    def _ps_plot_drawn(self, key):
+        """A plot has just been drawn: if it is the one shown in the editor, refresh the default values."""
+        if self._ps_in_change or key != self._ps_current_key():
+            return
+        self._ps_load_current()
+
+    def _ps_redraw(self, keys=None):
+        for key in (keys or self._plot_canvases):
+            canvas = self._plot_canvases.get(key)
+            if canvas is not None and canvas.figure.axes:
+                canvas.draw()
+
+    def _ps_changed(self, *_):
+        """A property was edited: store it, save the file and refresh the plot."""
+        if self._ps_loading:
+            return
+        key = self._ps_current_key()
+        if key is None:
+            return
+        self.plot_styles.set(key, {f: self._ps_get[f]() for f in PLOT_STYLE_DEFAULTS})
+        self.plot_styles.save()
+        self._ps_in_change = True
+        try:
+            self._ps_redraw([key])
+        finally:
+            self._ps_in_change = False
+
+    def _ps_reset_current(self):
+        key = self._ps_current_key()
+        if key is None:
+            return
+        self.plot_styles.reset(key)
+        self.plot_styles.save()
+        self._ps_load_current()
+        self._ps_redraw([key])
+
+    def _ps_reset_all(self):
+        ans = QtWidgets.QMessageBox.question(
+            self, 'Reset to default', 'Reset the settings of ALL plots to the plugin defaults?',
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No, QtWidgets.QMessageBox.No)
+        if ans != QtWidgets.QMessageBox.Yes:
+            return
+        self.plot_styles.reset()
+        self.plot_styles.save()
+        self._ps_load_current()
+        self._ps_redraw()
+
+    def _ps_copy_to_all(self):
+        """Copy the appearance (not texts nor axis limits) of the selected plot to all the others."""
+        key = self._ps_current_key()
+        if key is None:
+            return
+        src = {f: v for f, v in self.plot_styles.get(key).items() if f not in PLOT_STYLE_SPECIFIC}
+        for k, _label in PLOT_REGISTRY:
+            if k == key:
+                continue
+            keep = {f: v for f, v in self.plot_styles.get(k).items() if f in PLOT_STYLE_SPECIFIC}
+            keep.update(src)
+            self.plot_styles.set(k, keep)
+        self.plot_styles.save()
+        self._ps_redraw()
+
+    def _ps_export(self):
+        path, _flt = QtWidgets.QFileDialog.getSaveFileName(
+            self, 'Export plot settings', 'geostatisticslab_plot_settings.json', 'JSON (*.json)')
+        if path:
+            if not self.plot_styles.save(path):
+                QtWidgets.QMessageBox.warning(self, 'Export', 'The file could not be written.')
+
+    def _ps_import(self):
+        path, _flt = QtWidgets.QFileDialog.getOpenFileName(
+            self, 'Import plot settings', '', 'JSON (*.json)')
+        if not path:
+            return
+        if not self.plot_styles.load(path):
+            QtWidgets.QMessageBox.warning(self, 'Import', 'The file is not a valid settings file.')
+            self.plot_styles.load()
+            return
+        self.plot_styles.save()
+        self._ps_load_current()
+        self._ps_redraw()
+
     def on_plot_options_changed(self):
         if self.last_lags is not None and self.last_results is not None:
             self.plot_multi_variogram(self.last_lags, self.last_results)
@@ -814,6 +2193,186 @@ class GeostatisticsLabDialog(QtWidgets.QDialog, FORM_CLASS):
                 'a3': self.tableWidget_models.cellWidget(row, 7).value()
             })
         return structures
+
+    # ------------------------------------------------------------------
+    # Kriging parameter file (.kriging_par)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _set_spin_value(sb, value):
+        """Set a spin box value, widening its limits if necessary (no silent clamping)."""
+        if isinstance(sb, QtWidgets.QSpinBox):
+            value = int(round(value))
+        if value > sb.maximum():
+            sb.setMaximum(value)
+        if value < sb.minimum():
+            sb.setMinimum(value)
+        sb.setValue(value)
+
+    def _kriging_par_collect(self):
+        """Current kriging parameters of the GUI as a dict."""
+        layer = self.mMapLayerComboBox.currentLayer()
+        if self.radioButton_SimpleKriging.isChecked():
+            ktype = 'SK'
+        elif self.radioButton_UniversalKriging.isChecked():
+            ktype = 'UK'
+        else:
+            ktype = 'OK'
+        return {
+            'type': ktype,
+            'mean_sk': self.doubleSpinBox_mean_sk.value(),
+            'on_points': self.radioButton_estim_points.isChecked(),
+            'nx': self.spinBox_Nx.value(), 'xmin': self.doubleSpinBox_xmin.value(),
+            'dx': self.doubleSpinBox_dx.value(),
+            'ny': self.spinBox_Ny.value(), 'ymin': self.doubleSpinBox_ymin.value(),
+            'dy': self.doubleSpinBox_dy.value(),
+            'pts_min': self.spinBox_kriging_num_points_min.value(),
+            'pts_max': self.spinBox_kriging_num_points_max.value(),
+            'r_max': self.doubleSpinBox_searchR_max.value(),
+            'r_min': self.doubleSpinBox_searchR_min.value(),
+            'azimuth': self.doubleSpinBox_search_azimuth.value(),
+            'octants': self.checkBox_octant_search.isChecked(),
+            'min_octant': self.spinBox_min_point_per_octant.value(),
+            'layer': layer.name() if layer else '',
+            'field': self.mFieldComboBox.currentField() or '',
+            'out_raster': self.lineEdit_estimated_layer_name.text().strip(),
+            'points_layer': self.comboBox_estim_points.currentText().strip(),
+            'out_points': self.lineEdit_estim_vect_name.text().strip(),
+        }
+
+    def save_kriging_par(self):
+        """Save the kriging parameters of the GUI (and, if checkBox_save_include_variogram_model
+        is checked, the variogram model) in a .kriging_par file."""
+        import datetime
+        p = self._kriging_par_collect()
+        include_model = self.checkBox_save_include_variogram_model.isChecked()
+        structures = self.get_models_from_table() if include_model else []
+        settings = QSettings()
+        last_dir = settings.value('GeostatisticsLab/export_dir', os.path.expanduser('~'))
+        stem = re.sub(r'[\\/:*?"<>|]', '_', '_'.join(x for x in (p['layer'], p['field']) if x) or 'kriging')
+        suggested = os.path.join(
+            last_dir, '%s_%s%s' % (datetime.datetime.now().strftime('%Y_%m_%d_%H_%M_%S'), stem,
+                                   KRIGING_PAR_EXT))
+        file_path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Save kriging parameters", suggested,
+            "Kriging parameters (*%s);;All files (*.*)" % KRIGING_PAR_EXT)
+        if not file_path:
+            return
+        if not file_path.lower().endswith(KRIGING_PAR_EXT):
+            file_path += KRIGING_PAR_EXT
+        settings.setValue('GeostatisticsLab/export_dir', os.path.dirname(file_path))
+        try:
+            kriging_par_write(file_path, p, structures)
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Save kriging parameters",
+                                           "Could not write the file:\n%s\n\n%s" % (file_path, e))
+            return
+        QtWidgets.QMessageBox.information(
+            self, "Save kriging parameters",
+            "Kriging parameters saved:\n%s\n(%s)" % (
+                file_path, "variogram model included: %d structure(s)" % len(structures)
+                if structures else "variogram model not included"))
+
+    def load_kriging_par(self):
+        """Read a .kriging_par file and set the kriging widgets. The variogram model is loaded
+        only if checkBox_load_include_variogram_model is checked."""
+        settings = QSettings()
+        last_dir = settings.value('GeostatisticsLab/export_dir', os.path.expanduser('~'))
+        file_path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Load kriging parameters", last_dir,
+            "Kriging parameters (*%s);;All files (*.*)" % KRIGING_PAR_EXT)
+        if not file_path:
+            return
+        settings.setValue('GeostatisticsLab/export_dir', os.path.dirname(file_path))
+        try:
+            p, structures = kriging_par_read(file_path)      # nothing is changed if this fails
+        except (ValueError, OSError, UnicodeDecodeError) as e:
+            QtWidgets.QMessageBox.critical(self, "Load kriging parameters",
+                                           "Could not read the file:\n%s\n\n%s" % (file_path, e))
+            return
+        include_model = self.checkBox_load_include_variogram_model.isChecked()
+        notes = self._kriging_par_apply(p, structures, include_model)
+        msg = "Kriging parameters loaded:\n%s" % file_path
+        if notes:
+            msg += "\n\n" + "\n".join(notes)
+        QtWidgets.QMessageBox.information(self, "Load kriging parameters", msg)
+
+    def _kriging_par_apply(self, p, structures, include_model):
+        """Set the widgets from the parsed file. Returns a list of notes for the user."""
+        notes = []
+        # 1. Data layer and variable first: changing them resets the grid and search defaults.
+        if p['layer']:
+            layers = QgsProject.instance().mapLayersByName(p['layer'])
+            if layers:
+                if self.mMapLayerComboBox.currentLayer() != layers[0]:
+                    self.mMapLayerComboBox.setLayer(layers[0])
+                if p['field']:
+                    self.mFieldComboBox.setField(p['field'])
+                    if self.mFieldComboBox.currentField() != p['field']:
+                        notes.append('Variable "%s" not found in layer "%s".' % (p['field'], p['layer']))
+            else:
+                notes.append('Layer "%s" is not in the project: the current layer was kept.' % p['layer'])
+        # 2. Kriging type and mean
+        {'SK': self.radioButton_SimpleKriging, 'OK': self.radioButton_OrdinaryKriging,
+         'UK': self.radioButton_UniversalKriging}[p['type']].setChecked(True)
+        self._set_spin_value(self.doubleSpinBox_mean_sk, p['mean_sk'])
+        # 3. Estimation target
+        (self.radioButton_estim_points if p['on_points'] else self.radioButton_estim_grid).setChecked(True)
+        if p['points_layer']:
+            idx = self.comboBox_estim_points.findText(p['points_layer'])
+            if idx >= 0:
+                self.comboBox_estim_points.setCurrentIndex(idx)
+            elif p['on_points']:
+                notes.append('Layer of the estimation points "%s" is not in the project.' % p['points_layer'])
+        if p['out_points']:
+            self.lineEdit_estim_vect_name.setText(p['out_points'])
+        if p['out_raster']:
+            self.lineEdit_estimated_layer_name.setText(p['out_raster'])
+        # 4. Grid (all the signals blocked: they would recompute the other widgets)
+        grid = [self.doubleSpinBox_xmin, self.doubleSpinBox_xmax, self.doubleSpinBox_ymin,
+                self.doubleSpinBox_ymax, self.spinBox_Nx, self.spinBox_Ny,
+                self.doubleSpinBox_dx, self.doubleSpinBox_dy]
+        for sb in grid:
+            sb.blockSignals(True)
+        self._set_spin_value(self.doubleSpinBox_xmin, p['xmin'])
+        self._set_spin_value(self.doubleSpinBox_ymin, p['ymin'])
+        self._set_spin_value(self.spinBox_Nx, p['nx'])
+        self._set_spin_value(self.spinBox_Ny, p['ny'])
+        self._set_spin_value(self.doubleSpinBox_dx, p['dx'])
+        self._set_spin_value(self.doubleSpinBox_dy, p['dy'])
+        self._set_spin_value(self.doubleSpinBox_xmax, p['xmin'] + p['nx'] * p['dx'])
+        self._set_spin_value(self.doubleSpinBox_ymax, p['ymin'] + p['ny'] * p['dy'])
+        for sb in grid:
+            sb.blockSignals(False)
+        # 5. Search neighbourhood
+        self._set_spin_value(self.spinBox_kriging_num_points_min, p['pts_min'])
+        self._set_spin_value(self.spinBox_kriging_num_points_max, p['pts_max'])
+        self._set_spin_value(self.doubleSpinBox_searchR_max, p['r_max'])
+        self._set_spin_value(self.doubleSpinBox_searchR_min, p['r_min'])
+        self._set_spin_value(self.doubleSpinBox_search_azimuth, p['azimuth'])
+        self.checkBox_octant_search.setChecked(p['octants'])
+        self._set_spin_value(self.spinBox_min_point_per_octant, p['min_octant'])
+        # 6. Variogram model
+        if include_model:
+            if not structures:
+                notes.append('The file does not contain a variogram model: the current model was kept.')
+            else:
+                tw = self.tableWidget_models
+                tw.blockSignals(True)
+                tw.setRowCount(0)
+                for st in structures:
+                    self.add_model_structure_row(st['type'], st['sill'])
+                    row = tw.rowCount() - 1
+                    for col, key in ((1, 'sill'), (2, 'r1'), (3, 'r2'), (4, 'r3'),
+                                     (5, 'a1'), (6, 'a2'), (7, 'a3')):
+                        sb = tw.cellWidget(row, col)
+                        sb.blockSignals(True)
+                        self._set_spin_value(sb, st[key])
+                        sb.blockSignals(False)
+                tw.blockSignals(False)
+                self.variogram_computed = True      # the model comes from the file, not the default
+                self.on_plot_options_changed()
+                notes.append('Variogram model loaded: %d structure(s).' % len(structures))
+        return notes
 
     def export_variogram_to_png(self):
         """Export the current variogram plot to a PNG file.
@@ -896,6 +2455,119 @@ class GeostatisticsLabDialog(QtWidgets.QDialog, FORM_CLASS):
             QtWidgets.QMessageBox.critical(
                 self, "Export variogram",
                 f"Failed to save the image:\n{str(e)}")
+
+    def _format_elapsed_time(self, seconds):
+        """Format an elapsed time for the GUI, e.g. '12.34 s' or '75.20 s (1 min 15.2 s)'."""
+        text = "%.2f s" % seconds
+        if seconds >= 60.0:
+            minutes = int(seconds // 60)
+            text += " (%d min %.1f s)" % (minutes, seconds - 60 * minutes)
+        return text
+
+    def _report_kriging_time(self, seconds):
+        """Store the kriging run time and show it in the Computing_krig_time label."""
+        self.last_kriging_time_s = seconds
+        self.Computing_krig_time.setText(
+            "Computing time: " + self._format_elapsed_time(seconds))
+
+    def export_variogram_to_csv(self):
+        """Export the experimental variogram currently held in memory to a CSV file.
+
+        The file is written in "long" format, one row per (azimuth, lag bin), so
+        that it can be plotted directly in a spreadsheet or compared with the
+        output of other software (SGeMS, GSLIB, gstat, ...). Columns:
+
+            azimuth_deg  - direction, degrees clockwise from North
+            lag_index    - 0-based index of the lag bin
+            lag_center   - nominal centre of the bin (k * lag size)
+            h            - distance at which the point is plotted: the mean pair
+                           distance of the bin if "Effective distance" was
+                           enabled when the variogram was computed, otherwise
+                           equal to lag_center
+            gamma        - experimental semivariance (empty if the bin has no pairs)
+            num_pairs    - number of point pairs used in the bin
+
+        Delimiter is a comma and the decimal separator is a dot (RFC 4180 style).
+        """
+        if self.last_lags is None or self.last_results is None:
+            QtWidgets.QMessageBox.warning(
+                self, "Export variogram",
+                "No variogram has been calculated yet.\n"
+                "Please run Calculate first.")
+            return
+
+        # -- 1. Build suggested filename (same convention as the PNG export) --
+        import datetime, re
+        timestamp = datetime.datetime.now().strftime('%Y_%m_%d_%H_%M_%S')
+
+        # Use the layer/field of the LAST computed variogram, not the current
+        # combo box selection, which the user may have changed in the meantime.
+        layer = QgsProject.instance().mapLayer(self.last_layer_id) if self.last_layer_id else None
+        layer_name = layer.name() if layer else 'layer'
+        field_name = self.last_field_name if self.last_field_name else 'variable'
+
+        def safe(s):
+            return re.sub(r'[\\/:*?"<>|]', '_', s)
+
+        suggested_name = (
+            f"{timestamp}_{safe(layer_name)}_{safe(field_name)}_variogram.csv"
+        )
+
+        settings  = QSettings()
+        last_dir  = settings.value('GeostatisticsLab/export_dir',
+                                   os.path.expanduser('~'))
+        suggested = os.path.join(last_dir, suggested_name)
+
+        # -- 2. Save dialog ----------------------------------------------------
+        file_path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "Export variogram to CSV",
+            suggested,
+            "CSV files (*.csv);;All files (*.*)"
+        )
+        if not file_path:
+            return
+        if not file_path.lower().endswith('.csv'):
+            file_path += '.csv'
+        settings.setValue('GeostatisticsLab/export_dir',
+                          os.path.dirname(file_path))
+
+        # -- 3. Write the file -------------------------------------------------
+        def fmt(value):
+            """Full-precision number, or an empty cell for NaN / missing values."""
+            if value is None or not np.isfinite(value):
+                return ''
+            return '%.12g' % value
+
+        lags = np.asarray(self.last_lags, dtype=float)
+        n_rows = 0
+        try:
+            # newline='' lets the csv module control line endings (no blank
+            # lines on Windows); UTF-8 is used although the content is ASCII.
+            with open(file_path, 'w', newline='', encoding='utf-8') as fh:
+                writer = csv.writer(fh)
+                writer.writerow(['azimuth_deg', 'lag_index', 'lag_center',
+                                 'h', 'gamma', 'num_pairs'])
+                # results[az] = (gamma, counts, gamma_values, h_effective, pair_dists)
+                for az, (gamma, counts, _gv, h_eff, _pd) in self.last_results.items():
+                    for k in range(len(lags)):
+                        writer.writerow([
+                            fmt(float(az)),
+                            k,
+                            fmt(lags[k]),
+                            fmt(h_eff[k]),
+                            fmt(gamma[k]),
+                            int(counts[k]),
+                        ])
+                        n_rows += 1
+            QtWidgets.QMessageBox.information(
+                self, "Export variogram",
+                f"Variogram exported successfully:\n{file_path}\n"
+                f"({n_rows} rows, {len(self.last_results)} direction(s))")
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(
+                self, "Export variogram",
+                f"Failed to save the CSV file:\n{str(e)}")
 
     def export_variogram_map_to_png(self):
         """Export the current variogram map plot to a PNG file.
@@ -1589,10 +3261,275 @@ class GeostatisticsLabDialog(QtWidgets.QDialog, FORM_CLASS):
         avg_max = float(np.mean(dist_max[valid]))
         return avg_min, avg_avg, avg_max
 
+    # ---------------------------------------------------------
+    # AutoVar (automatic variogram in the two principal directions)
+    # ---------------------------------------------------------
+    def run_autovar(self):
+        """Run the Python port of the AutoVar program (autovar_core.py) on the
+        selected layer / field, then draw the experimental variogram of the two
+        principal directions together with the model fitted by AutoVar."""
+        layer = self.mMapLayerComboBox.currentLayer()
+        field_name = self.mFieldComboBox.currentField()
+        if not layer or not field_name:
+            QtWidgets.QMessageBox.warning(self, "Warning", "Please select a valid layer and field.")
+            return
+
+        try:
+            from . import autovar_core as av
+        except ImportError:
+            import autovar_core as av
+        if getattr(av, 'AUTOVAR_CORE_VERSION', 1) < 2:
+            QtWidgets.QMessageBox.critical(
+                self, "AutoVar",
+                "The file autovar_core.py in the plugin folder is an old version.\n"
+                "Replace it with the latest autovar_core.py and restart QGIS "
+                "(or reload the plugin).")
+            return
+
+        # -- data: same extraction rule used by the experimental variogram ---------------
+        xs, ys, vs = [], [], []
+        for f in layer.getFeatures():
+            if not f.hasGeometry():
+                continue
+            val = f[field_name]
+            if val == NULL or val is None:
+                continue
+            try:
+                pt = f.geometry().asPoint()
+                v = float(val)
+                x, y = float(pt.x()), float(pt.y())
+            except (ValueError, TypeError):
+                continue
+            if np.isfinite(x) and np.isfinite(y) and np.isfinite(v):
+                xs.append(x)
+                ys.append(y)
+                vs.append(v)
+        if len(vs) < 30:
+            QtWidgets.QMessageBox.warning(
+                self, "AutoVar", "AutoVar needs at least 30 valid data points (found %d)." % len(vs))
+            return
+
+        # -- progress dialog (the random-search fit takes about a minute) ----------------
+        QApp = QtWidgets.QApplication
+        dlg = QtWidgets.QProgressDialog("AutoVar: preparing...", "Cancel", 0, 100, self)
+        dlg.setWindowTitle("AutoVar")
+        dlg.setWindowModality(QtCore.Qt.WindowModal)
+        dlg.setMinimumDuration(0)
+        dlg.setValue(0)
+        self.pushButton_runAutoVar.setEnabled(False)
+        if hasattr(self, 'progressBar_autofit'):
+            self.progressBar_autofit.setValue(0)
+
+        def _log(msg):
+            dlg.setLabelText("AutoVar: " + msg)
+            QApp.processEvents()
+            if dlg.wasCanceled():
+                raise av.AutoVarCancelled()
+
+        def _progress(it, total, obj):
+            pct = int(100.0 * it / total)
+            dlg.setLabelText("AutoVar: fitting the model (%d%%), objective = %.4f" % (pct, obj))
+            dlg.setValue(min(pct, 99))
+            if hasattr(self, 'progressBar_autofit'):
+                self.progressBar_autofit.setValue(pct)
+            QApp.processEvents()
+            if dlg.wasCanceled():
+                raise av.AutoVarCancelled()
+
+        # checkBox_reproduce_autovar: run the algorithm as in the original Fortran program,
+        # including its known bugs and its single-precision input (for comparison only).
+        reproduce = (hasattr(self, 'checkBox_reproduce_autovar')
+                     and self.checkBox_reproduce_autovar.isChecked())
+        t0 = time.perf_counter()
+        try:
+            _log("computing the principal directions and the experimental variograms...")
+            res = av.run_autovar(np.array(xs), np.array(ys), np.array(vs),
+                                 progress=_progress, log=_log,
+                                 legacy=reproduce, float32_input=reproduce)
+        except av.AutoVarCancelled:
+            dlg.close()
+            self.pushButton_runAutoVar.setEnabled(True)
+            return
+        except av.AutoVarError as exc:
+            dlg.close()
+            self.pushButton_runAutoVar.setEnabled(True)
+            QtWidgets.QMessageBox.warning(self, "AutoVar", str(exc))
+            return
+        except Exception as exc:                      # pragma: no cover
+            dlg.close()
+            self.pushButton_runAutoVar.setEnabled(True)
+            QtWidgets.QMessageBox.critical(self, "AutoVar", "AutoVar failed:\n%s" % exc)
+            return
+        dlg.setValue(100)
+        dlg.close()
+        self.pushButton_runAutoVar.setEnabled(True)
+        if hasattr(self, 'progressBar_autofit'):
+            self.progressBar_autofit.setValue(100)
+
+        self.last_autovar_result = res
+        self.last_autovar_time_s = time.perf_counter() - t0
+        # Show the run time in the label next to the AutoVar button (label present in the GUI)
+        if hasattr(self, 'label_computing_time_autovar'):
+            self.label_computing_time_autovar.setText(
+                "Computing time: " + self._format_elapsed_time(self.last_autovar_time_s))
+        self._plot_autovar(res, field_name)
+
+        m = res['model']
+        lines = ["AutoVar finished in %s." % self._format_elapsed_time(self.last_autovar_time_s),
+                 "Mode: %s" % ("reproduction of the original Fortran program (with its bugs)" if reproduce
+                               else "corrected algorithm"),
+                 "",
+                 "Data: %d   mean = %.4g   variance = %.4g" % (res['nd'], res['mean'], res['variance']),
+                 "Major axis: azimuth %.2f\u00b0 (GSLIB azimuth %.2f\u00b0)   minor axis: %.2f\u00b0"
+                 % (res['az_major'], res['angle_gslib'], res['az_minor']),
+                 "Lag size (major / minor): %.1f / %.1f" % (res['lags']['major'], res['lags']['minor']),
+                 "",
+                 "Model for the standardised variable (nugget 0, total sill 1):"]
+        for k in range(m['nst']):
+            lines.append("  %d) Spherical  sill %.3f   a_major %.1f   a_minor %.1f"
+                         % (k + 1, m['cc'][k], m['ahmax'][k], m['ahmin'][k]))
+        lines.append("")
+        lines.append("Objective: %.4f (start %.4f)" % (res['fit']['final_obj'], res['fit']['start_obj']))
+        # -- model -> tableWidget_models (ready to be used for kriging) -----------------
+        normalized = (hasattr(self, 'checkBox_Normalize_by_variance')
+                      and self.checkBox_Normalize_by_variance.isChecked())
+        scale = 1.0 if normalized else res['variance']
+        self._autovar_model_to_table(res, scale)
+        lines.append("Model copied to the structure table (sills %s)." %
+                     ("kept standardised (total sill 1)" if normalized else
+                      "multiplied by the sample variance %.6g" % scale))
+        save_files = hasattr(self, 'checkBox_saveAutovar') and self.checkBox_saveAutovar.isChecked()
+        box = QtWidgets.QMessageBox(self)
+        box.setWindowTitle("AutoVar")
+        box.setIcon(QtWidgets.QMessageBox.Information)
+        box.setText("\n".join(lines))
+        box.setStandardButtons(QtWidgets.QMessageBox.Ok)
+        box.exec_()
+        if save_files:
+            self._save_autovar_outputs(res, layer.name(), field_name)
+
+    def _autovar_model_to_table(self, res, scale=1.0):
+        """Replace the rows of tableWidget_models with the AutoVar model (spherical
+        structures, r1 = range along the major axis, r2 = along the minor axis,
+        a1 = azimuth of the major axis)."""
+        m = res['model']
+        az = res['az_major'] % 180.0
+        tw = self.tableWidget_models
+        tw.blockSignals(True)
+        tw.setRowCount(0)
+
+        def sb(val, max_val=1e9):
+            w = QtWidgets.QDoubleSpinBox()
+            w.setDecimals(4)
+            w.setMinimum(-360.0 if max_val == 360 else 0.0)
+            w.setMaximum(max_val)
+            w.setValue(val)
+            w.setSingleStep(1.0 if max_val == 360 else 10.0)
+            return w
+
+        widgets = []
+        for k in range(m['nst']):
+            row = tw.rowCount()
+            tw.insertRow(row)
+            combo = QtWidgets.QComboBox()
+            combo.addItems(["Nugget", "Spherical", "Exponential", "Gaussian", "Linear", "Cubic"])
+            combo.setCurrentText("Spherical")
+            tw.setCellWidget(row, 0, combo)
+            ws = [sb(float(m['cc'][k]) * scale), sb(float(m['ahmax'][k])), sb(float(m['ahmin'][k])),
+                  sb(0.0), sb(az, 360), sb(0.0, 360), sb(0.0, 360)]
+            for col, w in enumerate(ws, start=1):
+                tw.setCellWidget(row, col, w)
+            widgets.append((combo, ws))
+        # connect the change signals only now, so that filling the table does not
+        # trigger a re-plot of the old experimental variogram over the AutoVar plot
+        for combo, ws in widgets:
+            combo.currentIndexChanged.connect(self.on_plot_options_changed)
+            for w in ws:
+                w.valueChanged.connect(self.on_plot_options_changed)
+        tw.blockSignals(False)
+        self.variogram_computed = True
+
+    def _save_autovar_outputs(self, res, layer_name, field_name):
+        """Write the three text files produced by the Fortran AutoVar program."""
+        try:
+            from . import autovar_core as av
+        except ImportError:
+            import autovar_core as av
+        folder = QtWidgets.QFileDialog.getExistingDirectory(self, "Folder for the AutoVar output files")
+        if not folder:
+            return
+        base = re.sub(r"[^A-Za-z0-9_.-]+", "_", "%s_%s" % (layer_name, field_name))
+        files = {
+            "autovar_%s.out" % base: av.format_experimental(res),
+            "autovarmod_%s.out" % base: av.format_model_points(res),
+            "varfit_%s.out" % base: av.format_gslib_model(res),
+        }
+        try:
+            for name, text in files.items():
+                with open(os.path.join(folder, name), "w") as fh:
+                    fh.write(text)
+        except OSError as exc:
+            QtWidgets.QMessageBox.critical(self, "AutoVar", "Cannot write the files:\n%s" % exc)
+            return
+        QtWidgets.QMessageBox.information(
+            self, "AutoVar", "Saved in %s:\n%s" % (folder, "\n".join(files.keys())))
+
+    def _plot_autovar(self, res, field_name=""):
+        """Experimental variogram (1 - pseudo-correlogram) in the two principal directions
+        and the spherical model fitted by AutoVar, drawn on the variogram canvas."""
+        try:
+            from . import autovar_core as av
+        except ImportError:
+            import autovar_core as av
+        self.figure_vario.clear()
+        ax = self.figure_vario.add_subplot(111)
+        m = res['model']
+        show_counts = hasattr(self, 'checkBox_show_counts') and self.checkBox_show_counts.isChecked()
+        specs = [('exp_major', m['ahmax'], 'firebrick', res['az_major'], 'major'),
+                 ('exp_minor', m['ahmin'], 'navy', res['az_minor'], 'minor')]
+        hmax = max(float(res[k]['dist'].max()) for k, _, _, _, _ in specs) * 1.05
+        hfine = np.linspace(0.0, hmax, 400)
+        for key, rng, color, az, name in specs:
+            e = res[key]
+            used = e['wt'] > 0
+            ax.plot(e['dist'], e['val'], linestyle=':', color=color, alpha=0.6)
+            ax.plot(e['dist'][used], e['val'][used], linestyle='none', marker='o',
+                    color=color, alpha=0.85, label="Azimuth %.1f\u00b0 (%s, Exp)" % (az, name))
+            if (~used).any():
+                ax.plot(e['dist'][~used], e['val'][~used], linestyle='none', marker='o',
+                        markerfacecolor='none', color=color, alpha=0.85,
+                        label="Azimuth %.1f\u00b0 (%s, not used in the fit)" % (az, name))
+            ax.plot(hfine, av.model_gamma(hfine, m['cc'], rng), linestyle='-', linewidth=2.0,
+                    color=color, alpha=0.9, label="Azimuth %.1f\u00b0 (%s, AutoVar model)" % (az, name))
+            if show_counts:
+                for d, v, n in zip(e['dist'], e['val'], e['num']):
+                    ax.annotate(str(int(n)), (d, v), textcoords="offset points", xytext=(0, 6),
+                                ha='center', fontsize=6, color=color)
+        ax.axhline(1.0, color='gray', linestyle='--', linewidth=0.8, alpha=0.6)
+        txt = "\n".join("%d) Sph  c=%.2f  a=%.0f / %.0f" % (k + 1, m['cc'][k], m['ahmax'][k], m['ahmin'][k])
+                        for k in range(m['nst']))
+        ax.text(0.99, 0.03, "AutoVar model (nugget 0, sill 1)\n" + txt, transform=ax.transAxes,
+                ha='right', va='bottom', fontsize=7, family='monospace',
+                bbox=dict(boxstyle='round', facecolor='white', alpha=0.8, edgecolor='lightgray'))
+        ax.set_title("AutoVar \u2013 %s" % field_name if field_name else "AutoVar")
+        ax.set_xlabel("Lag distance h")
+        ax.set_ylabel("1 \u2212 \u03c1(h)  (pseudo-correlogram)")
+        ax.grid(True, linestyle=':', alpha=0.6)
+        ax.set_xlim(0, hmax)
+        ax.set_ylim(bottom=0)
+        ax.legend(loc='upper left', fontsize=7)
+        self.figure_vario.tight_layout()
+        self.canvas_vario.draw()
+
     def calculate_variogram(self):
         layer = self.mMapLayerComboBox.currentLayer()
         field_name = self.mFieldComboBox.currentField()
         if not layer or not field_name: return
+        
+        # Start of the timed section (reported in Computing_vrg_time). It covers
+        # reading the data, the adaptive lag search and the pair loop, and it
+        # stops before any plotting. No modal dialog is shown in between.
+        t_vario_start = time.perf_counter()
 
         max_dist = self.doubleSpinBox_max_distance.value()
         num_lags = self.spinBox_num_lags.value()
@@ -1702,8 +3639,13 @@ class GeostatisticsLabDialog(QtWidgets.QDialog, FORM_CLASS):
                        self.radioButton_adaptive_lag.isChecked())
         self.doubleSpinBox_lag_tolerance.setEnabled(not is_adaptive)
         azimuths = [(base_azimuth + d * (180.0 / num_dirs)) % 180.0 for d in range(num_dirs)]
-        ang_tol_rad = np.radians(ang_tol)
-        variogram_results = {}
+
+        # Largest separation that can still fall into a bin. The last bin is
+        # centered at (num_lags - 1) * lag, which equals the MaxDistance spinbox,
+        # and it accepts pairs up to centre + lag_tol. Cutting the pair search at
+        # MaxDistance itself would keep only the lower half of that last bin
+        # (about half of its pairs, and a biased gamma), unlike GSLIB/SGeMS.
+        dist_limit = max(max_dist, lag_centers[-1] + lag_tol)
 
         # -- Optional behaviors -----------------------------------------------
         # checkBox_Normalize_by_variance: divide gamma(h) by the global
@@ -1720,6 +3662,47 @@ class GeostatisticsLabDialog(QtWidgets.QDialog, FORM_CLASS):
         use_effective_distance = (hasattr(self, 'checkBox_effective_distance')
                                   and self.checkBox_effective_distance.isChecked())
 
+        variogram_results = self._compute_directional_variogram(
+            coords, values, point_weights, lag_centers, lag_tol, dist_limit,
+            azimuths, ang_tol, bandwidth, normalize_by_variance, sample_variance,
+            use_effective_distance, progress_cb=self.progressBar_vario.setValue)
+
+        self.progressBar_vario.setValue(100)
+
+        # End of the timed section: show the elapsed time to the user.
+        self.last_variogram_time_s = time.perf_counter() - t_vario_start
+        self.Computing_vrg_time.setText(
+            "Computing time: " + self._format_elapsed_time(self.last_variogram_time_s))
+
+        self.last_lags, self.last_results = lag_centers, variogram_results
+        # Remember whether gamma(h) was divided by the sample variance: the autofit must
+        # know the scale of the cached experimental values, whatever the state of the
+        # checkbox is when the autofit is launched.
+        self.last_variogram_normalized = bool(normalize_by_variance and sample_variance > 0)
+        self.last_layer_id, self.last_field_name = layer.id(), field_name
+        self.variogram_computed = True # Set flag to true as experimental calculation succeeded
+        
+        self.plot_multi_variogram(lag_centers, variogram_results)
+        self.update_fit_error()
+
+    def _compute_directional_variogram(self, coords, values, point_weights, lag_centers,
+                                       lag_tol, dist_limit, azimuths, ang_tol, bandwidth,
+                                       normalize_by_variance, sample_variance,
+                                       use_effective_distance, progress_cb=None):
+        """Pair search and estimator of the directional experimental variogram.
+
+        This is the computational core of calculate_variogram(), kept separate
+        so that the benchmark of the Benchmark tab runs exactly the same code.
+        It does not read or write any widget: progress_cb(percent), if given,
+        is called while the pairs are scanned.
+
+        Returns {azimuth: (gamma, pair_counts, gamma_values, h_effective, pair_dists)}.
+        """
+        num_dirs = len(azimuths)
+        num_points = len(values)
+        num_lags = len(lag_centers)
+        ang_tol_rad = np.radians(ang_tol)
+        variogram_results = {}
         total_steps = num_dirs * num_points
         step_count = 0
 
@@ -1733,13 +3716,14 @@ class GeostatisticsLabDialog(QtWidgets.QDialog, FORM_CLASS):
             for i in range(num_points):
                 step_count += 1
                 if i % 10 == 0:
-                    self.progressBar_vario.setValue(int((step_count / total_steps) * 100))
+                    if progress_cb is not None:
+                        progress_cb(int((step_count / total_steps) * 100))
                     QtWidgets.QApplication.processEvents()
 
                 for j in range(i + 1, num_points):
                     dx, dy = coords[j][0] - coords[i][0], coords[j][1] - coords[i][1]
                     dist = np.sqrt(dx**2 + dy**2)
-                    if dist > max_dist or dist == 0: continue
+                    if dist > dist_limit or dist == 0: continue
 
                     cos_alpha = np.clip((dx * u_x + dy * u_y) / dist, -1.0, 1.0)
                     alpha = np.arccos(np.abs(cos_alpha))
@@ -1788,14 +3772,692 @@ class GeostatisticsLabDialog(QtWidgets.QDialog, FORM_CLASS):
                 experimental_gamma = experimental_gamma / sample_variance
 
             variogram_results[az] = (experimental_gamma, pair_counts, gamma_values, h_effective, pair_dists)
+        return variogram_results
 
-        self.progressBar_vario.setValue(100)
-        self.last_lags, self.last_results = lag_centers, variogram_results
-        self.last_layer_id, self.last_field_name = layer.id(), field_name
-        self.variogram_computed = True # Set flag to true as experimental calculation succeeded
-        
-        self.plot_multi_variogram(lag_centers, variogram_results)
-        self.update_fit_error()
+    # =========================================================================
+    # Benchmark tab: computing time of the experimental variogram vs. layer size
+    # =========================================================================
+
+    _BENCH_VRG_DIRECTIONS = (1, 2, 4)   # numbers of directions that are timed
+    _BENCH_VRG_NUM_LAGS = 11            # lags 0, h, ..., 10 h with 10 h = field size
+
+    def _update_hardware_info(self, *_):
+        """Write in plainTextEdit_hardware the description of the machine."""
+        try:
+            text = hardware_description()
+        except Exception as e:
+            text = 'Hardware description not available (%s).' % e
+        self.plainTextEdit_hardware.setPlainText(text)
+
+    def _setup_benchmark_vrg_table(self):
+        """Create the model of tableBenchmarkresults_vrg and write its header."""
+        self._bench_vrg_model = QtGui.QStandardItemModel(0, 5, self)
+        self._bench_vrg_model.setHorizontalHeaderLabels([
+            "Layer", "N. points", "Time 1 dir (s)", "Time 2 dir (s)", "Time 4 dir (s)"])
+        self._bench_krig_model = QtGui.QStandardItemModel(0, 5, self)
+        self._bench_krig_model.setHorizontalHeaderLabels([
+            "Test", "nx", "ny", "N. nodes (nx x ny)", "Time (s)"])
+        self._bench_opt_model = QtGui.QStandardItemModel(0, 5, self)
+        self._bench_opt_model.setHorizontalHeaderLabels([
+            "Starting points", "Min SSE", "Max SSE", "Mean SSE", "Valid runs"])
+        self.tableBenchmarkresults_vrg.horizontalHeader().setStretchLastSection(True)
+        self._set_bench_mode('vrg')
+
+    def _set_bench_mode(self, mode):
+        """Show the variogram ('vrg'), kriging ('krig') or neighbourhood optimisation ('opt')
+        benchmark in the shared table."""
+        self._bench_mode = mode
+        self.tableBenchmarkresults_vrg.setModel(
+            {'krig': self._bench_krig_model,
+             'opt': self._bench_opt_model}.get(mode, self._bench_vrg_model))
+
+    def _benchmark_vrg_add_row(self, name, n_points, times):
+        items = [QtGui.QStandardItem(name), QtGui.QStandardItem(str(n_points))]
+        items += [QtGui.QStandardItem("%.3f" % t) for t in times]
+        for it in items:
+            it.setEditable(False)
+        self._bench_vrg_model.appendRow(items)
+        self.tableBenchmarkresults_vrg.resizeColumnsToContents()
+        self.tableBenchmarkresults_vrg.scrollToBottom()
+
+    def _create_benchmark_layer(self, name, n_points, field_size, seed):
+        """Memory point layer with n_points random points in [0, field_size]^2 and a
+        random field z_rnd in [0, 1]. The seed is fixed, so that the layers (and the
+        variograms) can be reproduced."""
+        rng = np.random.default_rng(seed)
+        xs = rng.uniform(0.0, field_size, n_points)
+        ys = rng.uniform(0.0, field_size, n_points)
+        zs = rng.uniform(0.0, 1.0, n_points)
+
+        layer = QgsVectorLayer("Point?crs=EPSG:3857", name, "memory")
+        pr = layer.dataProvider()
+        pr.addAttributes([QgsField("z_rnd", QVariant.Double)])
+        layer.updateFields()
+        feats = []
+        for x, y, z in zip(xs, ys, zs):
+            f = QgsFeature(layer.fields())
+            f.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(float(x), float(y))))
+            f.setAttributes([float(z)])
+            feats.append(f)
+        pr.addFeatures(feats)
+        layer.updateExtents()
+        QgsProject.instance().addMapLayer(layer)
+        return layer
+
+    def run_benchmark_variogram(self):
+        """Computing time of the experimental variogram as a function of the number of points.
+
+        For k = 1 ... Exponent (SpinBox_exponent) a memory layer benchmark_kk is created, with
+        Base**k random points (x, y uniform in [0, Field size], z_rnd uniform in
+        [0, 1]). On every layer the experimental variogram is computed with 11 lags
+        (centres 0, h, ..., 10 h, with 10 h = Field size), for 1, 2 and 4 directions,
+        by the same routine used by the Variogram tab (_compute_directional_variogram).
+        The other parameters are fixed: first azimuth 0, angular tolerance
+        90/number_of_directions, no bandwidth, no weights, no normalisation, h not
+        corrected. The time is that of the pair search and of the estimator; the
+        reading of the points of the layer (linear in N) and the plotting are not included.
+        If checkBox_removelayers is checked, every layer is removed from the project as
+        soon as its three variograms have been computed.
+        """
+        field_size = self.doubleSpinBox_fieldsize.value()
+        base = self.doubleSpinBox_base.value()
+        n_layers = int(self.SpinBox_exponent.value())
+        if n_layers < 1 or base < 1.0 or field_size <= 0:
+            QtWidgets.QMessageBox.warning(
+                self, "Benchmark", "Please check Field size, Base and Exponent.")
+            return
+        sizes = [max(2, int(round(base ** k))) for k in range(1, n_layers + 1)]
+
+        num_lags = self._BENCH_VRG_NUM_LAGS
+        lag_size = field_size / (num_lags - 1)
+        lag_tol = lag_size / 2.0
+        lag_centers = np.arange(num_lags) * lag_size
+        # same rule as calculate_variogram: the last lag is complete
+        dist_limit = max(field_size, lag_centers[-1] + lag_tol)
+
+        # new run: clear the previous results
+        self._set_bench_mode('vrg')
+        self.last_benchmark_vrg = []
+        self._bench_vrg_model.removeRows(0, self._bench_vrg_model.rowCount())
+        self.progressBar_bench_vrg.setValue(0)
+        self.pushButtonBenchVrg.setEnabled(False)
+        total_runs = len(sizes) * len(self._BENCH_VRG_DIRECTIONS)
+        run_index = 0
+
+        try:
+            for k, n_points in enumerate(sizes, start=1):
+                name = self._unique_layer_name("benchmark_%02d" % k)
+                layer = self._create_benchmark_layer(name, n_points, field_size, seed=1000 + k)
+
+                # read the points back from the layer, as calculate_variogram does
+                coords, values = [], []
+                for f in layer.getFeatures():
+                    pt = f.geometry().asPoint()
+                    coords.append([pt.x(), pt.y()])
+                    values.append(float(f["z_rnd"]))
+                coords, values = np.array(coords), np.array(values)
+                point_weights = np.ones(len(values))
+                sample_variance = float(np.var(values))
+
+                times = []
+                for nd in self._BENCH_VRG_DIRECTIONS:
+                    azimuths = [(0.0 + d * (180.0 / nd)) % 180.0 for d in range(nd)]
+                    ang_tol = 90.0 / nd
+
+                    def progress(pct, _r=run_index):
+                        self.progressBar_bench_vrg.setValue(
+                            int(100.0 * (_r + pct / 100.0) / total_runs))
+
+                    t0 = time.perf_counter()
+                    self._compute_directional_variogram(
+                        coords, values, point_weights, lag_centers, lag_tol, dist_limit,
+                        azimuths, ang_tol, 0.0, False, sample_variance, False,
+                        progress_cb=progress)
+                    times.append(time.perf_counter() - t0)
+                    run_index += 1
+                    self.progressBar_bench_vrg.setValue(int(100.0 * run_index / total_runs))
+
+                self.last_benchmark_vrg.append((name, len(values), times[0], times[1], times[2]))
+                self._benchmark_vrg_add_row(name, len(values), times)
+                self._plot_benchmark_variogram()
+                if self.checkBox_removelayers.isChecked():
+                    QgsProject.instance().removeMapLayer(layer.id())
+                QtWidgets.QApplication.processEvents()
+        finally:
+            self.pushButtonBenchVrg.setEnabled(True)
+
+        self.progressBar_bench_vrg.setValue(100)
+
+    def _plot_benchmark_variogram(self):
+        """Computing time (y) vs number of points (x), one series per number of directions.
+        Both axes are logarithmic, since N grows geometrically and the time as ~N^2."""
+        self.figure_bench_vrg.clear()
+        ax = self.figure_bench_vrg.add_subplot(111)
+        rows = self.last_benchmark_vrg
+        if rows:
+            n = [r[1] for r in rows]
+            for col, label, color in ((2, "1 direction", "firebrick"),
+                                      (3, "2 directions", "navy"),
+                                      (4, "4 directions", "forestgreen")):
+                ax.plot(n, [r[col] for r in rows], marker='o', label=label, color=color)
+            ax.set_xscale('log')
+            ax.set_yscale('log')
+            ax.legend()
+        ax.set_xlabel("Number of points")
+        ax.set_ylabel("Computing time (s)")
+        ax.set_title("Experimental variogram: computing time (11 lags)")
+        ax.grid(True, which='both', alpha=0.3)
+        self.figure_bench_vrg.tight_layout()
+        self.canvas_bench_vrg.draw()
+
+    def export_benchmark_vrg_to_csv(self):
+        """Export the table of the Benchmark tab (variogram, kriging or optimisation, whichever is shown)."""
+        mode = self._bench_mode
+        rows = {'krig': self.last_benchmark_krig,
+                'opt': self.last_benchmark_opt}.get(mode, self.last_benchmark_vrg)
+        kind = {'krig': 'kriging', 'opt': 'neighbourhood_optimisation'}.get(mode, 'variogram')
+        if not rows:
+            QtWidgets.QMessageBox.warning(
+                self, "Export benchmark",
+                "No benchmark results yet.\nPlease run the benchmark first.")
+            return
+        import datetime
+        timestamp = datetime.datetime.now().strftime('%Y_%m_%d_%H_%M_%S')
+        settings = QSettings()
+        last_dir = settings.value('GeostatisticsLab/export_dir', os.path.expanduser('~'))
+        file_path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Export benchmark to CSV",
+            os.path.join(last_dir, "%s_benchmark_%s.csv" % (timestamp, kind)),
+            "CSV files (*.csv);;All files (*.*)")
+        if not file_path:
+            return
+        if not file_path.lower().endswith('.csv'):
+            file_path += '.csv'
+        settings.setValue('GeostatisticsLab/export_dir', os.path.dirname(file_path))
+        try:
+            with open(file_path, 'w', newline='', encoding='utf-8') as fh:
+                writer = csv.writer(fh)
+                if mode == 'opt':
+                    writer.writerow(['starting_points', 'min_sse', 'max_sse', 'mean_sse',
+                                     'valid_runs', 'runs'])
+                    for n_start, s_min, s_max, s_mean, n_valid, n_runs in rows:
+                        writer.writerow([n_start, '%.10g' % s_min, '%.10g' % s_max,
+                                         '%.10g' % s_mean, n_valid, n_runs])
+                else:
+                    if mode == 'krig':
+                        writer.writerow(['test', 'nx', 'ny', 'num_nodes', 'time_s'])
+                    else:
+                        writer.writerow(['layer', 'num_points', 'time_1_direction_s',
+                                         'time_2_directions_s', 'time_4_directions_s'])
+                    for row in rows:
+                        if mode == 'krig':
+                            # row = (test, n_nodes, time_s, nx, ny)
+                            writer.writerow([row[0], row[3], row[4], row[1], '%.6f' % row[2]])
+                        else:
+                            writer.writerow([row[0], row[1]] + ['%.6f' % x for x in row[2:]])
+            QtWidgets.QMessageBox.information(
+                self, "Export benchmark",
+                "Benchmark exported successfully:\n%s\n(%d rows)"
+                % (file_path, len(rows)))
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(
+                self, "Export benchmark", "Failed to save the CSV file:\n%s" % str(e))
+
+    def export_benchmark_vrg_to_png(self):
+        """Export the plot of the Benchmark tab to a PNG file."""
+        mode = self._bench_mode
+        kind = {'krig': 'kriging', 'opt': 'neighbourhood_optimisation'}.get(mode, 'variogram')
+        if not {'krig': self.last_benchmark_krig,
+                'opt': self.last_benchmark_opt}.get(mode, self.last_benchmark_vrg):
+            QtWidgets.QMessageBox.warning(
+                self, "Export benchmark",
+                "No benchmark results yet.\nPlease run the benchmark first.")
+            return
+        dpi, ok = QtWidgets.QInputDialog.getInt(
+            self, "Export resolution", "Output resolution (DPI):",
+            value=300, min=72, max=1200, step=50)
+        if not ok:
+            return
+        import datetime
+        timestamp = datetime.datetime.now().strftime('%Y_%m_%d_%H_%M_%S')
+        settings = QSettings()
+        last_dir = settings.value('GeostatisticsLab/export_dir', os.path.expanduser('~'))
+        file_path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Export benchmark plot to PNG",
+            os.path.join(last_dir, "%s_benchmark_%s.png" % (timestamp, kind)),
+            "PNG images (*.png);;All files (*.*)")
+        if not file_path:
+            return
+        if not file_path.lower().endswith('.png'):
+            file_path += '.png'
+        settings.setValue('GeostatisticsLab/export_dir', os.path.dirname(file_path))
+        try:
+            # The canvas is usually wide and low: export with a normal figure shape
+            # (the on-screen size is restored afterwards).
+            fig = self.figure_bench_vrg
+            old_size = fig.get_size_inches().copy()
+            try:
+                fig.set_size_inches(6.5, 4.0)
+                fig.tight_layout()
+                fig.savefig(file_path, dpi=dpi, bbox_inches='tight',
+                            facecolor=fig.get_facecolor())
+            finally:
+                fig.set_size_inches(old_size)
+                fig.tight_layout()
+                self.canvas_bench_vrg.draw()
+            QtWidgets.QMessageBox.information(
+                self, "Export benchmark",
+                "Plot exported successfully:\n%s\n(DPI: %d)" % (file_path, dpi))
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(
+                self, "Export benchmark", "Failed to save the image:\n%s" % str(e))
+
+    # -------------------------------------------------------------------------
+    # Benchmark tab: computing time of the kriging vs. number of estimation nodes
+    # -------------------------------------------------------------------------
+
+    def _benchmark_krig_add_row(self, name, n_nodes, seconds, nx, ny):
+        items = [QtGui.QStandardItem(name), QtGui.QStandardItem(str(nx)),
+                 QtGui.QStandardItem(str(ny)), QtGui.QStandardItem(str(n_nodes)),
+                 QtGui.QStandardItem("%.3f" % seconds)]
+        for it in items:
+            it.setEditable(False)
+        self._bench_krig_model.appendRow(items)
+        self.tableBenchmarkresults_vrg.resizeColumnsToContents()
+        self.tableBenchmarkresults_vrg.scrollToBottom()
+
+    def _plot_benchmark_kriging(self, label=""):
+        """Computing time (y) vs number of estimated nodes (x), log-log."""
+        self.figure_bench_vrg.clear()
+        ax = self.figure_bench_vrg.add_subplot(111)
+        rows = self.last_benchmark_krig
+        if rows:
+            ax.plot([r[1] for r in rows], [r[2] for r in rows], marker='o',
+                    color='firebrick', label=label or "kriging")
+            ax.set_xscale('log')
+            ax.set_yscale('log')
+            # plain-text tick labels also when the range is shorter than a decade
+            from matplotlib.ticker import LogFormatter
+            for axis in (ax.xaxis, ax.yaxis):
+                axis.set_major_formatter(LogFormatter())
+                axis.set_minor_formatter(LogFormatter())
+            ax.legend()
+        ax.set_xlabel("Number of estimated nodes (nx x ny)")
+        ax.set_ylabel("Computing time (s)")
+        ax.set_title("Kriging: computing time")
+        ax.grid(True, which='both', alpha=0.3)
+        self.figure_bench_vrg.tight_layout()
+        self.canvas_bench_vrg.draw()
+
+    @staticmethod
+    def _add_vsimem_raster(name, array, xmin, ymin, Nx, Ny, dx, dy, crs_wkt, tag):
+        """Add a float32 array to the project as a raster layer that lives only in
+        memory (GDAL /vsimem/ GeoTIFF, nothing is written to disk). Returns
+        (layer or None, vsimem path)."""
+        from osgeo import gdal, osr
+        path = "/vsimem/geostatlab_bench_%s.tif" % tag
+        ds = gdal.GetDriverByName('GTiff').Create(path, Nx, Ny, 1, gdal.GDT_Float32)
+        ds.SetGeoTransform((xmin, dx, 0.0, ymin + Ny * dy, 0.0, -dy))
+        if crs_wkt:
+            srs = osr.SpatialReference()
+            srs.ImportFromWkt(crs_wkt)
+            ds.SetProjection(srs.ExportToWkt())
+        band = ds.GetRasterBand(1)
+        band.WriteArray(array)
+        band.FlushCache()
+        ds = None
+        layer = QgsRasterLayer(path, name)
+        if layer.isValid():
+            QgsProject.instance().addMapLayer(layer)
+            return layer, path
+        return None, path
+
+    def run_kriging_benchmark(self):
+        """Computing time of the kriging as a function of the number of estimated nodes.
+
+        Uses the data layer/field, the kriging type, the search neighbourhood and
+        the variogram model currently set in the GUI. The grid of the Kriging tab is
+        the reference (test 1). In test k the extent is the same, while Nx and Ny are
+        multiplied by k (dx, dy divided by k), so the number of nodes grows as k^2.
+        The number of tests is spinBox_n_krigin_tests. The timed section is the
+        estimation of the grid (the same code as the Calculate button, _krige_grid);
+        building the raster layers is not included. Rasters kriging_kk and
+        kriging_kk_var are added to the project as in-memory GDAL rasters (no file);
+        if remove_layers_krige_bm is checked they are all removed at the end.
+        """
+        # 1. variogram model must exist
+        structures = self.get_models_from_table()
+        if not structures or not self.variogram_computed:
+            QtWidgets.QMessageBox.warning(
+                self, "Kriging benchmark",
+                "No variogram model is defined.\n"
+                "Compute the experimental variogram and fit (or enter) a model in the "
+                "Variogram tab, then run the benchmark again.")
+            self.tabWidget.setCurrentIndex(1)
+            return
+        try:
+            from osgeo import gdal  # noqa: F401
+        except ImportError:
+            QtWidgets.QMessageBox.critical(
+                self, "Kriging benchmark", "GDAL library not available in QGIS environment.")
+            return
+
+        # 2. data
+        layer = self.mMapLayerComboBox.currentLayer()
+        field_name = self.mFieldComboBox.currentField()
+        if not layer or not field_name:
+            QtWidgets.QMessageBox.critical(self, "Kriging benchmark",
+                                           "Invalid point layer or field chosen.")
+            return
+        coords, values = [], []
+        for f in layer.getFeatures():
+            if f.hasGeometry():
+                val = f[field_name]
+                if val != NULL and val is not None:
+                    try:
+                        pt = f.geometry().asPoint()
+                        coords.append([pt.x(), pt.y()])
+                        values.append(float(val))
+                    except (ValueError, TypeError):
+                        continue
+        coords, values = np.array(coords), np.array(values)
+        if len(values) >= 1:
+            # duplicated locations make the kriging matrix singular: keep the first one
+            _, first_idx = np.unique(np.round(coords, decimals=6), axis=0, return_index=True)
+            first_idx = np.sort(first_idx)
+            coords, values = coords[first_idx], values[first_idx]
+        if len(values) < 3:
+            QtWidgets.QMessageBox.critical(self, "Kriging benchmark",
+                                           "Kriging requires at least 3 points.")
+            return
+        X_known, Y_known = coords[:, 0], coords[:, 1]
+
+        # 3. parameters from the GUI
+        xmin, ymin = self.doubleSpinBox_xmin.value(), self.doubleSpinBox_ymin.value()
+        Nx, Ny = self.spinBox_Nx.value(), self.spinBox_Ny.value()
+        dx, dy = self.doubleSpinBox_dx.value(), self.doubleSpinBox_dy.value()
+        if Nx < 1 or Ny < 1 or dx <= 0 or dy <= 0:
+            QtWidgets.QMessageBox.warning(
+                self, "Kriging benchmark", "Please check the estimation grid (Nx, Ny, dx, dy).")
+            return
+        search_r_max = self.doubleSpinBox_searchR_max.value()
+        search_r_min = self.doubleSpinBox_searchR_min.value()
+        search_azimuth = self.doubleSpinBox_search_azimuth.value()
+        if search_r_max <= 0:
+            QtWidgets.QMessageBox.warning(
+                self, "Kriging benchmark",
+                "Range max of the search neighbourhood must be greater than zero.")
+            return
+        use_octants = self.checkBox_octant_search.isChecked()
+        min_per_octant = self.spinBox_min_point_per_octant.value()
+        pts_min = self.spinBox_kriging_num_points_min.value()
+        pts_max = self.spinBox_kriging_num_points_max.value()
+        NO_VALUE = (float(self.doubleSpinBox_nodata_value.value())
+                    if hasattr(self, "doubleSpinBox_nodata_value") else -9999.0)
+        is_ok = self.radioButton_OrdinaryKriging.isChecked()
+        is_uk = self.radioButton_UniversalKriging.isChecked()
+        type_name = "Ordinary" if is_ok else ("Universal" if is_uk else "Simple")
+        mean_value = self.doubleSpinBox_mean_sk.value()
+        n_tests = int(self.spinBox_n_krigin_tests.value())
+        crs_wkt = layer.crs().toWkt() if layer.crs().isValid() else None
+
+        # new run: clear the previous kriging results
+        self._set_bench_mode('krig')
+        self.last_benchmark_krig = []
+        self._bench_krig_model.removeRows(0, self._bench_krig_model.rowCount())
+        self.progressBar_krige_test.setValue(0)
+        self.pushButtonKriginBenchmark.setEnabled(False)
+        created = []        # (layer or None, vsimem path)
+        failed_layers = 0
+        plot_label = "%s kriging, %d data" % (type_name, len(values))
+
+        try:
+            import uuid
+            for k in range(1, n_tests + 1):
+                Nx_k, Ny_k = Nx * k, Ny * k
+                dx_k, dy_k = dx / k, dy / k
+
+                def progress(pct, _k=k):
+                    self.progressBar_krige_test.setValue(
+                        int(100.0 * (_k - 1 + pct / 100.0) / n_tests))
+
+                t0 = time.perf_counter()
+                raster, variance = self._krige_grid(
+                    X_known, Y_known, values, structures, xmin, ymin, Nx_k, Ny_k, dx_k, dy_k,
+                    is_ok, is_uk, search_r_max, search_r_min, search_azimuth,
+                    use_octants, min_per_octant, pts_min, pts_max,
+                    mean_value, NO_VALUE, progress)
+                elapsed = time.perf_counter() - t0
+
+                name = "kriging_%02d" % k
+                n_nodes = Nx_k * Ny_k
+                self.last_benchmark_krig.append((name, n_nodes, elapsed, Nx_k, Ny_k))
+                self._benchmark_krig_add_row(name, n_nodes, elapsed, Nx_k, Ny_k)
+                self._plot_benchmark_kriging(plot_label)
+
+                # rasters in memory (outside the timed section)
+                for suffix, arr in (("", raster), ("_var", variance)):
+                    lyr, path = self._add_vsimem_raster(
+                        self._unique_layer_name(name + suffix), arr, xmin, ymin,
+                        Nx_k, Ny_k, dx_k, dy_k, crs_wkt, uuid.uuid4().hex)
+                    created.append((lyr, path))
+                    if lyr is None:
+                        failed_layers += 1
+                self.progressBar_krige_test.setValue(int(100.0 * k / n_tests))
+                QtWidgets.QApplication.processEvents()
+        finally:
+            self.pushButtonKriginBenchmark.setEnabled(True)
+            if self.remove_layers_krige_bm.isChecked():
+                from osgeo import gdal
+                for lyr, path in created:
+                    if lyr is not None:
+                        QgsProject.instance().removeMapLayer(lyr.id())
+                    gdal.Unlink(path)
+            self._populate_raster_combo()
+
+        self.progressBar_krige_test.setValue(100)
+        if failed_layers:
+            QtWidgets.QMessageBox.warning(
+                self, "Kriging benchmark",
+                "%d raster(s) could not be loaded in QGIS. The timings are not affected."
+                % failed_layers)
+
+
+    # -------------------------------------------------------------------------
+    # Benchmark tab: neighbourhood optimisation vs number of starting points
+    # -------------------------------------------------------------------------
+
+    def _plot_benchmark_opt(self):
+        """Min, mean and max over the repeated runs of the cross-validation SSE of the
+        best solution, as a function of the number of starting points."""
+        self.figure_bench_vrg.clear()
+        ax = self.figure_bench_vrg.add_subplot(111)
+        rows = [r for r in self.last_benchmark_opt if r[4] > 0]
+        from matplotlib.ticker import FuncFormatter, NullFormatter
+        exp10, scale = 0, 1.0
+        if rows:
+            top = max(abs(v) for r in rows for v in (r[1], r[2], r[3]) if v == v)
+            if top > 0:
+                exp10 = int(np.floor(np.log10(top)))
+                scale = 10.0 ** exp10
+            x = [r[0] for r in rows]
+            mn = [r[1] for r in rows]       # SSE min / max / mean over the runs
+            mx = [r[2] for r in rows]
+            mean = [r[3] for r in rows]
+            ax.fill_between(x, mn, mx, color='0.5', alpha=0.15, linewidth=0)
+            ax.plot(x, mx, color='firebrick', marker='o', ms=3, label='max')
+            ax.plot(x, mean, color='navy', marker='o', ms=3, label='mean')
+            ax.plot(x, mn, color='forestgreen', marker='o', ms=3, label='min')
+            if x[-1] / max(x[0], 1) >= 20:
+                ax.set_xscale('log')
+                ax.xaxis.set_major_formatter(FuncFormatter(lambda v, _: "%g" % v))
+                ax.xaxis.set_minor_formatter(NullFormatter())
+            ax.legend(loc='upper right', ncol=3, fontsize='small', frameon=False)
+            # SSE in units of a power of ten (shown in the axis label) instead of the
+            # matplotlib offset text, which ends up on top of the title
+            ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _: "%g" % (v / scale)))
+        ax.set_xlabel("Starting points")
+        ax.set_ylabel("CV SSE (\u00d710$^{%d}$)" % exp10 if rows else "CV SSE")
+        ax.set_title("Search optimisation (%d runs)" % self._opt_bench_runs, fontsize='medium')
+        ax.grid(True, which='both', alpha=0.3)
+        self.figure_bench_vrg.tight_layout()
+        self.canvas_bench_vrg.draw()
+
+    def _benchmark_opt_add_row(self, n_start, sse_min, sse_max, sse_mean, n_valid, n_runs):
+        def f(v):
+            return "n/a" if v != v else "%.6g" % v
+        items = [QtGui.QStandardItem(str(n_start)),
+                 QtGui.QStandardItem(f(sse_min)), QtGui.QStandardItem(f(sse_max)),
+                 QtGui.QStandardItem(f(sse_mean)),
+                 QtGui.QStandardItem("%d/%d" % (n_valid, n_runs))]
+        for it in items:
+            it.setEditable(False)
+        self._bench_opt_model.appendRow(items)
+        self.tableBenchmarkresults_vrg.resizeColumnsToContents()
+        self.tableBenchmarkresults_vrg.scrollToBottom()
+
+    def run_opt_benchmark(self):
+        """How many starting points does the neighbourhood optimisation need?
+
+        For n = spinBoxmin_iter, spinBoxmin_iter + spinBox_step, ... up to
+        spinBox_optimiz_starting_point (n = 1, 2, ... if the two spin boxes are 1) the
+        Latin Hypercube search of
+        run_ck_neighborhood_optimization (same parameters, same bounds, same kriging
+        type and variogram model, set in the GUI) is repeated spinBox_n_tentative
+        times with n starting points. Every run gives the cross-validation SSE (sum of the
+        squared leave-one-out errors) of its best solution; the minimum, the maximum and
+        the mean of the SSE over the runs are written in the table and plotted against n.
+        A run whose
+        trials all leave some point unestimated has no valid solution and is not counted
+        (column "Valid runs").
+        The seed of run r with n starting points is derived from lineEdit_seed_opt, n
+        and r, so the whole benchmark is repeatable and independent of the range of n.
+        The warm start (current parameters) is not used, so that only the Latin Hypercube
+        sample is evaluated; the GUI parameters are never modified. While the benchmark is
+        running the button becomes "Stop": the rows already computed are kept.
+        """
+        import random
+        if self._opt_bench_running:
+            self._opt_bench_stop = True
+            self.pushButton_opt_bench.setText("Stopping...")
+            return
+
+        # variogram model must exist
+        if not self.get_models_from_table() or not self.variogram_computed:
+            QtWidgets.QMessageBox.warning(
+                self, "Optimisation benchmark",
+                "No variogram model is defined.\n"
+                "Compute the experimental variogram and fit (or enter) a model in the "
+                "Variogram tab, then run the benchmark again.")
+            self.tabWidget.setCurrentIndex(1)
+            return
+        max_start = int(self.spinBox_optimiz_starting_point.value())
+        min_start = int(self.spinBoxmin_iter.value()) if hasattr(self, "spinBoxmin_iter") else 1
+        step = int(self.spinBox_step.value()) if hasattr(self, "spinBox_step") else 1
+        n_runs = int(self.spinBox_n_tentative.value())
+        if max_start < 1 or n_runs < 1 or min_start < 1 or step < 1:
+            QtWidgets.QMessageBox.warning(
+                self, "Optimisation benchmark",
+                "Please check the minimum and the maximum number of starting points, the "
+                "step and the number of tentatives (all must be at least 1).")
+            return
+        if min_start > max_start:
+            QtWidgets.QMessageBox.warning(
+                self, "Optimisation benchmark",
+                "The minimum number of starting points (%d) is larger than the maximum (%d)."
+                % (min_start, max_start))
+            return
+        start_values = list(range(min_start, max_start + 1, step))
+        ok, base_seed = self._read_seed_field(self.lineEdit_seed_opt, "Seed (benchmark)")
+        if not ok:
+            return
+        setup = self._ck_opt_read_setup(warn_default_model=False)
+        if setup is None:
+            return
+        if not setup['active_params']:
+            QtWidgets.QMessageBox.warning(
+                self, "Optimisation benchmark",
+                "No parameter is selected in the optimisation table (column Use).")
+            return
+
+        # new run: clear the previous results
+        self._set_bench_mode('opt')
+        self.last_benchmark_opt = []
+        self._opt_bench_runs = n_runs
+        self._bench_opt_model.removeRows(0, self._bench_opt_model.rowCount())
+        self.progressBar_opt_bench.setValue(0)
+        self.computingtimebenchparam_neigh.setText("computing time:")
+        button_text = self.pushButton_opt_bench.text()
+        self.pushButton_opt_bench.setText("Stop")
+        self._opt_bench_running = True
+        self._opt_bench_stop = False
+        total_trials = n_runs * sum(start_values)
+        done = [0]
+        t0 = time.perf_counter()
+        n_failed = 0
+        stopped = False
+
+        def stop_cb():
+            return self._opt_bench_stop
+
+        try:
+            for n_start in start_values:
+                sses = []
+                incomplete = False
+                for r in range(n_runs):
+                    rng = random.Random("%d-%d-%d" % (base_seed, n_start, r))
+
+                    def progress(it, _n, _d=done[0]):
+                        self.progressBar_opt_bench.setValue(
+                            int(100.0 * (_d + it) / total_trials))
+                        QtWidgets.QApplication.processEvents()
+
+                    res = self._ck_opt_search(
+                        setup, n_start, rng, progress_cb=progress,
+                        include_warm_start=False, stop_cb=stop_cb, process_events=False)
+                    if not res['completed']:
+                        incomplete = True
+                        break
+                    done[0] += n_start
+                    if res['best_params'] is not None:
+                        sses.append(res['best_sse'])
+                    else:
+                        n_failed += 1       # no trial estimated all the points
+                    QtWidgets.QApplication.processEvents()
+                if incomplete:
+                    # stopped in the middle of this point: it is not reported
+                    stopped = True
+                    break
+                arr = np.array(sses, dtype=float)       # SSE of the best solution of each run
+                if len(arr):
+                    sse_min, sse_max, sse_mean = float(arr.min()), float(arr.max()), float(arr.mean())
+                else:
+                    sse_min = sse_max = sse_mean = float('nan')
+                self.last_benchmark_opt.append(
+                    (n_start, sse_min, sse_max, sse_mean, len(arr), n_runs))
+                self._benchmark_opt_add_row(n_start, sse_min, sse_max, sse_mean,
+                                            len(arr), n_runs)
+                self._plot_benchmark_opt()
+                self.computingtimebenchparam_neigh.setText(
+                    "computing time: " + self._format_elapsed_time(time.perf_counter() - t0))
+                QtWidgets.QApplication.processEvents()
+                if self._opt_bench_stop:
+                    stopped = True
+                    break
+        finally:
+            self._opt_bench_running = False
+            self._opt_bench_stop = False
+            self.pushButton_opt_bench.setText(button_text)
+
+        elapsed = time.perf_counter() - t0
+        text = "computing time: " + self._format_elapsed_time(elapsed)
+        if stopped:
+            text += " (stopped)"
+        if n_failed:
+            text += " [%d runs without a valid solution]" % n_failed
+        self.computingtimebenchparam_neigh.setText(text)
+        if not stopped:
+            self.progressBar_opt_bench.setValue(100)
 
     def calculate_variogram_map(self):
         """Compute a circular variogram map: the experimental semivariance
@@ -1876,6 +4538,11 @@ class GeostatisticsLabDialog(QtWidgets.QDialog, FORM_CLASS):
         # empty circle that would otherwise appear at the centre of the map.
         lag_centers = np.arange(num_lags) * lag_size
 
+        # Largest separation that can still fall into a ring: the last ring is
+        # centered at (num_lags - 1) * lag and accepts pairs up to centre + lag_tol
+        # (cutting at MaxDistance would keep only half of it, as in the variogram).
+        dist_limit = max(max_dist, lag_centers[-1] + lag_tol)
+
         # Sector centers covering the full circle (0..360), offset by the
         # base azimuth, each sector lasting 360/num_dirs degrees
         sector_width = 360.0 / num_dirs
@@ -1900,7 +4567,7 @@ class GeostatisticsLabDialog(QtWidgets.QDialog, FORM_CLASS):
             dy = coords[:, 1] - coords[i, 1]
             dist = np.sqrt(dx**2 + dy**2)
 
-            valid = (dist > 0) & (dist <= max_dist)
+            valid = (dist > 0) & (dist <= dist_limit)
             valid[i] = False
             if not np.any(valid):
                 continue
@@ -1978,11 +4645,11 @@ class GeostatisticsLabDialog(QtWidgets.QDialog, FORM_CLASS):
         # Ring edges: each ring spans +/- lag_size/2 around its center,
         # except the outermost ring, whose outer edge reflects the actual
         # tolerance used when binning pairs into that ring: pairs up to
-        # max_dist + lag_tol/2 were included, so the plotted outer radius
+        # last centre + lag_tol were included, so the plotted outer radius
         # must extend that far too (not just to max_dist, and not to the
         # inter-center gap, both of which under/over-stated the true extent).
         inner_edge = max(lag_centers[0] - lag_size / 2.0, 0.0)
-        outer_edge = max_dist + lag_tol / 2.0
+        outer_edge = max(max_dist, lag_centers[-1] + lag_tol)
         ring_edges = np.concatenate(([inner_edge], (lag_centers[:-1] + lag_centers[1:]) / 2.0,
                                      [outer_edge]))
 
@@ -2027,15 +4694,21 @@ class GeostatisticsLabDialog(QtWidgets.QDialog, FORM_CLASS):
         max_r = ring_edges[-1]
 
         # -- Main anisotropy directions via the inertia tensor ------------------
+        # The arrows and their labels are drawn OUTSIDE the circle of the map, so the
+        # limits of the axes are widened only when they are shown.
+        lim = max_r
+        major_angle_deg = minor_angle_deg = None
         if self.checkBox_compute_main_directions_variogram_map.isChecked():
             major_angle_deg, minor_angle_deg = self._compute_variogram_map_main_directions(
                 lag_centers, sector_centers, gamma_map, pair_count
             )
             if major_angle_deg is not None:
                 self._draw_main_direction_arrows(ax, major_angle_deg, minor_angle_deg, max_r)
+                lim = max_r * self._MAIN_DIR_AXIS_LIMIT
+        self._update_main_direction_labels(major_angle_deg, minor_angle_deg)
 
-        ax.set_xlim(-max_r, max_r)
-        ax.set_ylim(-max_r, max_r)
+        ax.set_xlim(-lim, lim)
+        ax.set_ylim(-lim, lim)
         ax.set_aspect('equal', adjustable='box')  # equal X/Y scale, no stretching
 
         ax.set_xlabel('X distance', fontsize=8)
@@ -2116,34 +4789,54 @@ class GeostatisticsLabDialog(QtWidgets.QDialog, FORM_CLASS):
 
         return major_angle_deg, minor_angle_deg
 
+    # The arrows go beyond the circle of the map (ARROW factor times its radius) and the
+    # labels with the angles sit just after the tips of the arrows, so they never overlap
+    # the map; the axes are widened (AXIS_LIMIT times the radius) to make room for them.
+    _MAIN_DIR_ARROW_LENGTH = 1.18
+    _MAIN_DIR_LABEL_OFFSET = 1.03
+    _MAIN_DIR_AXIS_LIMIT = 1.50
+
+    def _update_main_direction_labels(self, major_angle_deg, minor_angle_deg):
+        """Write the principal directions (geographic azimuth, degrees) in
+        label_major_dir_vario and label_minor_dir_vario ("n/a" when they are not
+        available, e.g. if the option is off)."""
+        def text(name, angle):
+            return "%s direction: %s" % (
+                name, "n/a" if angle is None else "%.1f\u00b0" % angle)
+        if hasattr(self, 'label_major_dir_vario'):
+            self.label_major_dir_vario.setText(text("Major", major_angle_deg))
+        if hasattr(self, 'label_minor_dir_vario'):
+            self.label_minor_dir_vario.setText(text("Minor", minor_angle_deg))
+
     def _draw_main_direction_arrows(self, ax, major_angle_deg, minor_angle_deg, max_r):
         """Draw the two principal anisotropy directions as double-headed
-        arrows (lines through the origin) on the variogram map axes."""
+        arrows (lines through the origin) on the variogram map axes. The arrows are
+        longer than the radius of the map, and the label of each one (its azimuth) is
+        placed beyond its tip, outside the circle."""
         def angle_to_xy_unit(angle_deg):
             math_angle_rad = np.radians(90.0 - angle_deg)
             return np.cos(math_angle_rad), np.sin(math_angle_rad)
 
-        arrow_len = max_r * 0.92
+        arrow_len = max_r * self._MAIN_DIR_ARROW_LENGTH
+        label_r = arrow_len * self._MAIN_DIR_LABEL_OFFSET
 
-        ux, uy = angle_to_xy_unit(major_angle_deg)
-        ax.annotate('', xy=(ux * arrow_len, uy * arrow_len),
-                   xytext=(-ux * arrow_len, -uy * arrow_len),
-                   arrowprops=dict(arrowstyle='<->', color='red', linewidth=2.0),
-                   zorder=5)
-        ax.text(ux * arrow_len * 1.05, uy * arrow_len * 1.05,
-               'Major (%.0f deg)' % major_angle_deg,
-               color='red', fontsize=7, fontweight='bold',
-               ha='center', va='center', zorder=6)
+        def draw(angle_deg, color, name):
+            ux, uy = angle_to_xy_unit(angle_deg)
+            ax.annotate('', xy=(ux * arrow_len, uy * arrow_len),
+                        xytext=(-ux * arrow_len, -uy * arrow_len),
+                        arrowprops=dict(arrowstyle='<->', color=color, linewidth=2.0),
+                        zorder=5)
+            # the label is aligned away from the tip, so the text never goes back
+            # towards the circle
+            ha = 'left' if ux > 0.3 else ('right' if ux < -0.3 else 'center')
+            va = 'bottom' if uy > 0.3 else ('top' if uy < -0.3 else 'center')
+            ax.text(ux * label_r, uy * label_r, '%s (%.1f\u00b0)' % (name, angle_deg),
+                    color=color, fontsize=7, fontweight='bold',
+                    ha=ha, va=va, zorder=6,
+                    bbox=dict(facecolor='white', edgecolor='none', alpha=0.8, pad=1.0))
 
-        vx, vy = angle_to_xy_unit(minor_angle_deg)
-        ax.annotate('', xy=(vx * arrow_len, vy * arrow_len),
-                   xytext=(-vx * arrow_len, -vy * arrow_len),
-                   arrowprops=dict(arrowstyle='<->', color='blue', linewidth=2.0),
-                   zorder=5)
-        ax.text(vx * arrow_len * 1.05, vy * arrow_len * 1.05,
-               'Minor (%.0f deg)' % minor_angle_deg,
-               color='blue', fontsize=7, fontweight='bold',
-               ha='center', va='center', zorder=6)
+        draw(major_angle_deg, 'red', 'Major')
+        draw(minor_angle_deg, 'blue', 'Minor')
 
     def _plot_variogram_map_3d(self):
         """Render the variogram map as a 3D surface (X, Y, semivariance) in
@@ -2729,6 +5422,12 @@ class GeostatisticsLabDialog(QtWidgets.QDialog, FORM_CLASS):
                     # Update the UI with the auto-incremented filename
                     self.lineEdit_estimated_layer_name.setText(output_filename.replace(".tif", ""))
 
+        # Start of the timed section (reported in Computing_krig_time). All the
+        # modal dialogs (default variogram warning, duplicates, overwrite
+        # question) have already been answered, so the user's reaction time is
+        # not counted. It covers the model/matrix set-up and the estimation.
+        t_krig_start = time.perf_counter()
+
         # 5. Build the theoretical semivariance model
         structures = self.get_models_from_table()
         
@@ -2776,6 +5475,9 @@ class GeostatisticsLabDialog(QtWidgets.QDialog, FORM_CLASS):
                 mean_value, sample_variance, NO_VALUE
             )
             if out_layer is not None:
+                # End of the timed section; update the label BEFORE the modal
+                # "Done" message box so that the time is visible behind it.
+                self._report_kriging_time(time.perf_counter() - t_krig_start)
                 QtWidgets.QMessageBox.information(
                     self, "Done",
                     "Point-based kriging complete.\n"
@@ -2789,10 +5491,92 @@ class GeostatisticsLabDialog(QtWidgets.QDialog, FORM_CLASS):
         # 7. Estimation loop over all grid nodes (final raster matrix)
         # Initialise raster matrices. Rows = Ny, Columns = Nx.
         # Note: GIS rasters originate from the top-left corner (Y max, X min)
+        self.progressBar_kriging.setValue(0)
+        raster_data, variance_data = self._krige_grid(
+            X_known, Y_known, values, structures, xmin, ymin, Nx, Ny, dx, dy,
+            is_ok, is_uk, search_r_max, search_r_min, search_azimuth,
+            use_octants, min_per_octant, pts_min, pts_max,
+            mean_value, NO_VALUE, self.progressBar_kriging.setValue)
+        self.progressBar_kriging.setValue(100)
+
+        # End of the timed section: the estimation over all grid nodes is done.
+        # Writing the GeoTIFF files and loading them in QGIS (steps 8-9) is disk
+        # I/O and is deliberately not included in the reported time.
+        self._report_kriging_time(time.perf_counter() - t_krig_start)
+
+        # 8. Scrittura fisica del file raster GeoTIFF tramite la libreria standard GDAL
+        try:
+            from osgeo import gdal, osr
+        except ImportError:
+            QtWidgets.QMessageBox.critical(self, "GDAL Error", "GDAL library not available in QGIS environment.")
+            return
+
+        driver = gdal.GetDriverByName('GTiff')
+        # Create the raster dataset: File, Columns (Nx), Rows (Ny), Bands (1), Data type (Float32)
+        dataset = driver.Create(output_path, Nx, Ny, 1, gdal.GDT_Float32)
+        
+        # Set raster GeoTransformation
+        # [X_min, X_resolution, X_rotation, Y_max, Y_rotation, -Y_resolution]
+        # Negative dy because the raster origin is at the top-left corner
+        geotransform = (xmin, dx, 0.0, ymin + Ny * dy, 0.0, -dy)
+        dataset.SetGeoTransform(geotransform)
+        
+        # Assign the same CRS as the input point vector layer
+        if layer.crs().isValid():
+            srs = osr.SpatialReference()
+            srs.ImportFromWkt(layer.crs().toWkt())
+            dataset.SetProjection(srs.ExportToWkt())
+            
+        band = dataset.GetRasterBand(1)
+        band.WriteArray(raster_data)
+        band.FlushCache()
+        dataset = None # Chiude e salva fisicamente il file sul disco
+        # Prepara il percorso
+        var_path = output_path.replace(".tif", "_var.tif")
+        
+        # Create the variance dataset
+        dataset_var = driver.Create(var_path, Nx, Ny, 1, gdal.GDT_Float32)
+        dataset_var.SetGeoTransform(geotransform)
+        if layer.crs().isValid():
+            dataset_var.SetProjection(srs.ExportToWkt())
+            
+        band_var = dataset_var.GetRasterBand(1)
+        band_var.WriteArray(variance_data)
+        band_var.FlushCache()
+        dataset_var = None
+        # 9. Automatically load the computed raster into QGIS
+        for path in [output_path, var_path]:
+            file_info = QtCore.QFileInfo(path)
+            raster_layer = QgsRasterLayer(path, file_info.completeBaseName())
+            if raster_layer.isValid():
+                QgsProject.instance().addMapLayer(raster_layer)
+            else:
+                QtWidgets.QMessageBox.critical(self, "Error", "Failed to load the generated raster: %s" % path)
+
+        # Update comboBox_raster so the new kriging rasters are available
+        self._populate_raster_combo()
+        QtWidgets.QMessageBox.information(self, "Done", "Kriging complete. Rasters loaded.")
+
+    def _krige_grid(self, X_known, Y_known, values, structures, xmin, ymin, Nx, Ny, dx, dy,
+                    is_ok, is_uk, search_r_max, search_r_min, search_azimuth,
+                    use_octants, min_per_octant, pts_min, pts_max,
+                    mean_value, NO_VALUE, progress_cb):
+        """Estimate all the nodes of a regular grid (cell centres) by local kriging.
+
+        Returns (raster_data, variance_data), two float32 arrays of shape (Ny, Nx)
+        whose first row is the top one (GIS convention). Nodes that cannot be
+        estimated are set to NO_VALUE. progress_cb(percent) is called every 500
+        nodes. Kriging type: Ordinary if is_ok, Universal (linear drift) if is_uk,
+        Simple otherwise. This is the loop formerly inside run_kriging_interpolation.
+        """
+        def get_cov_or_semi(h_dists, x_from, y_from, x_to, y_to):
+            return self.calculate_theoretical_semivariance(
+                h_dists, (x_from, y_from, x_to, y_to), structures
+            )
+
         raster_data = np.zeros((Ny, Nx), dtype=np.float32)
         variance_data = np.zeros((Ny, Nx), dtype=np.float32) # NUOVA MATRICE
         
-        self.progressBar_kriging.setValue(0)
         total_pixels = Ny * Nx
         pixel_count = 0
 
@@ -2841,7 +5625,7 @@ class GeostatisticsLabDialog(QtWidgets.QDialog, FORM_CLASS):
                     variance_data[r, c] = NO_VALUE
                     pixel_count += 1
                     if pixel_count % 500 == 0:
-                        self.progressBar_kriging.setValue(int((pixel_count / total_pixels) * 100))
+                        progress_cb(int((pixel_count / total_pixels) * 100))
                         QtWidgets.QApplication.processEvents()
                     continue
 
@@ -2933,63 +5717,10 @@ class GeostatisticsLabDialog(QtWidgets.QDialog, FORM_CLASS):
                 
                 pixel_count += 1
                 if pixel_count % 500 == 0:
-                    self.progressBar_kriging.setValue(int((pixel_count / total_pixels) * 100))
+                    progress_cb(int((pixel_count / total_pixels) * 100))
                     QtWidgets.QApplication.processEvents()
 
-        self.progressBar_kriging.setValue(100)
-
-        # 8. Scrittura fisica del file raster GeoTIFF tramite la libreria standard GDAL
-        try:
-            from osgeo import gdal, osr
-        except ImportError:
-            QtWidgets.QMessageBox.critical(self, "GDAL Error", "GDAL library not available in QGIS environment.")
-            return
-
-        driver = gdal.GetDriverByName('GTiff')
-        # Create the raster dataset: File, Columns (Nx), Rows (Ny), Bands (1), Data type (Float32)
-        dataset = driver.Create(output_path, Nx, Ny, 1, gdal.GDT_Float32)
-        
-        # Set raster GeoTransformation
-        # [X_min, X_resolution, X_rotation, Y_max, Y_rotation, -Y_resolution]
-        # Negative dy because the raster origin is at the top-left corner
-        geotransform = (xmin, dx, 0.0, ymin + Ny * dy, 0.0, -dy)
-        dataset.SetGeoTransform(geotransform)
-        
-        # Assign the same CRS as the input point vector layer
-        if layer.crs().isValid():
-            srs = osr.SpatialReference()
-            srs.ImportFromWkt(layer.crs().toWkt())
-            dataset.SetProjection(srs.ExportToWkt())
-            
-        band = dataset.GetRasterBand(1)
-        band.WriteArray(raster_data)
-        band.FlushCache()
-        dataset = None # Chiude e salva fisicamente il file sul disco
-        # Prepara il percorso
-        var_path = output_path.replace(".tif", "_var.tif")
-        
-        # Create the variance dataset
-        dataset_var = driver.Create(var_path, Nx, Ny, 1, gdal.GDT_Float32)
-        dataset_var.SetGeoTransform(geotransform)
-        if layer.crs().isValid():
-            dataset_var.SetProjection(srs.ExportToWkt())
-            
-        band_var = dataset_var.GetRasterBand(1)
-        band_var.WriteArray(variance_data)
-        band_var.FlushCache()
-        dataset_var = None
-        # 9. Automatically load the computed raster into QGIS
-        for path in [output_path, var_path]:
-            file_info = QtCore.QFileInfo(path)
-            raster_layer = QgsRasterLayer(path, file_info.completeBaseName())
-            if raster_layer.isValid():
-                QgsProject.instance().addMapLayer(raster_layer)
-            else:
-                QtWidgets.QMessageBox.critical(self, "Error", "Failed to load the generated raster: %s" % path)
-
-        # Update comboBox_raster so the new kriging rasters are available
-        self._populate_raster_combo()
-        QtWidgets.QMessageBox.information(self, "Done", "Kriging complete. Rasters loaded.")
+        return raster_data, variance_data
 
     def _estimate_single_point(self, x_node, y_node, X_known, Y_known, values,
                                    is_ok, is_sk, is_uk, structures,
@@ -3318,36 +6049,35 @@ class GeostatisticsLabDialog(QtWidgets.QDialog, FORM_CLASS):
             n_valid += 1
         return sse, n_valid
 
-    def run_ck_neighborhood_optimization(self):
-        """Random-search optimization of the kriging neighbourhood parameters
-        by minimizing the leave-one-out cross-validation SSE.
+    def _read_seed_field(self, line_edit, label):
+        """Read an integer seed from a QLineEdit. Returns (ok, seed).
+        An empty field gets a random seed, which is written back in the field so that
+        the run can be repeated exactly."""
+        txt = line_edit.text().strip()
+        if not txt:
+            import random
+            seed = random.SystemRandom().randrange(1, 2 ** 31)
+            line_edit.setText(str(seed))
+            return True, seed
+        try:
+            return True, int(txt)
+        except ValueError:
+            QtWidgets.QMessageBox.warning(
+                self, "Seed", "%s must be an integer number." % label)
+            return False, None
 
-        Only configurations where ALL data points can be estimated are
-        considered valid. Any candidate that leaves at least one point
-        unestimated receives a penalty of inf and is discarded, preventing
-        a spurious SSE reduction caused by skipping difficult points.
-
-        Algorithm
-        ---------
-        1. Read which parameters to optimize and their bounds from the
-           optimization table.
-        2. Run N_ITER random trials, each with a random combination of the
-           active parameters sampled within their bounds.
-        3. For each trial evaluate the LOO-CV SSE via _run_cv_sse().
-        4. Write the best parameter set back to the neighbourhood widgets.
-        """
-        import random
-
-        N_ITER = 80  # number of random trials
-
+    def _ck_opt_read_setup(self, warn_default_model=True):
+        """Read from the GUI everything the neighbourhood optimisation needs: the data,
+        the kriging type, the variogram model and the bounds of the parameters to search.
+        Returns a dict, or None (after showing a message) if something is missing."""
         # -- 1. Check prerequisites -------------------------------------------
         layer      = self.mMapLayerComboBox.currentLayer()
         field_name = self.mFieldComboBox.currentField()
         if not layer or not field_name:
             QtWidgets.QMessageBox.critical(self, "Error",
                 "Please select a valid point layer and field first.")
-            return
-        if not self.variogram_computed:
+            return None
+        if warn_default_model and not self.variogram_computed:
             QtWidgets.QMessageBox.warning(self, "Warning",
                 "No variogram model computed. The optimization will use the current "
                 "(possibly default) model parameters.")
@@ -3370,11 +6100,10 @@ class GeostatisticsLabDialog(QtWidgets.QDialog, FORM_CLASS):
         if len(values) < 3:
             QtWidgets.QMessageBox.critical(self, "Error",
                 "At least 3 valid points are required.")
-            return
+            return None
 
         coords  = np.array(coords)
         values  = np.array(values)
-        NO_VAL  = -9999.0
 
         # Kriging type and fixed parameters
         structures      = self.get_models_from_table()
@@ -3447,40 +6176,41 @@ class GeostatisticsLabDialog(QtWidgets.QDialog, FORM_CLASS):
 
             param_cfg[wname] = {'use': True, 'lo': lo, 'hi': hi, 'type': ptype}
 
-        # -- 4. Update "Current value" column before starting -----------------
-        for row, param in enumerate(self._CK_OPT_PARAMS):
-            cur_item = tw.item(row, self._COL_CUR)
-            if cur_item is not None:
-                cur_item.setText(str(fixed[param['widget']]))
+        # Active parameters, in a stable order
+        active_params = [(wname, cfg) for wname, cfg in param_cfg.items() if cfg['use']]
+        return {
+            'coords': coords, 'values': values, 'structures': structures,
+            'sample_variance': sample_variance, 'mean_value': mean_value,
+            'is_ok': is_ok, 'is_sk': is_sk, 'is_uk': is_uk,
+            'fixed': fixed, 'param_cfg': param_cfg, 'active_params': active_params,
+            'NO_VAL': -9999.0, 'tw': tw,
+        }
 
-        # -- 5. Build the Latin Hypercube sample plan -------------------------
-        # LHS guarantees that each parameter's range is uniformly covered:
-        # the [lo, hi] interval is divided into N_ITER equal strata and
-        # exactly one sample is drawn from each stratum.  Columns are then
-        # shuffled independently so that no two rows share the same stratum
-        # on every dimension simultaneously.  This gives far better space-
-        # filling coverage than pure Monte Carlo with the same budget.
-        #
-        # Candidate 0 is always the CURRENT parameter values (warm-start):
-        # this guarantees the optimisation never returns a solution worse
-        # than what the user already has, even if all random trials fail.
+    def _ck_opt_search(self, setup, n_trials, rng, progress_cb=None,
+                       include_warm_start=True, stop_cb=None, process_events=True):
+        """Latin Hypercube search of the neighbourhood parameters (n_trials trials).
 
-        import random as _random
-
-        # Collect the active parameters in a stable order
-        active_params = [(wname, cfg) for wname, cfg in param_cfg.items()
-                         if cfg['use']]
-        n_active = len(active_params)
+        The [lo, hi] interval of every active parameter is divided into n_trials equal
+        strata and one sample is drawn from each; the columns are then shuffled
+        independently. rng is a random.Random instance (the seed makes the search
+        repeatable). Candidate 0 is the current set of parameters (warm start), which
+        is skipped if include_warm_start is False. Every candidate is evaluated by the
+        leave-one-out SSE (_run_cv_sse). Returns a dict with the best solution among
+        those that estimate all the points (best_*), and the fallback (fallback_*) used
+        when none does; 'completed' is False if stop_cb() interrupted the search.
+        progress_cb(iteration, n_trials) is called after every candidate.
+        """
+        coords, values = setup['coords'], setup['values']
+        fixed, active_params = setup['fixed'], setup['active_params']
 
         # Build LHS strata for each active parameter
-        # strata[p] is a list of N_ITER values, one per stratum, shuffled
         strata = []
         for _wname, cfg in active_params:
             lo, hi, ptype = cfg['lo'], cfg['hi'], cfg['type']
             col = []
-            for k in range(N_ITER):
+            for k in range(n_trials):
                 # sample uniformly within stratum k
-                u = (k + _random.random()) / N_ITER
+                u = (k + rng.random()) / n_trials
                 v = lo + u * (hi - lo)
                 if ptype == 'int':
                     v = int(round(lo + u * (hi - lo)))
@@ -3488,22 +6218,20 @@ class GeostatisticsLabDialog(QtWidgets.QDialog, FORM_CLASS):
                 elif ptype == 'bool':
                     v = bool(u > 0.5)
                 col.append(v)
-            _random.shuffle(col)
+            rng.shuffle(col)
             strata.append(col)
 
-        # -- 6. Optimisation loop  --------------------------------------------
         best_sse      = float('inf')
         best_params   = None
-
         fallback_valid  = -1
         fallback_sse    = float('inf')
         fallback_params = None
+        completed = True
 
-        pb = self.progressBar_CK_opt if hasattr(self, 'progressBar_CK_opt') else None
-        if pb:
-            pb.setValue(0)
-
-        for iteration in range(N_ITER + 1):   # +1 for the warm-start
+        for iteration in range(0 if include_warm_start else 1, n_trials + 1):
+            if stop_cb is not None and stop_cb():
+                completed = False
+                break
             candidate = dict(fixed)
 
             if iteration == 0:
@@ -3534,13 +6262,13 @@ class GeostatisticsLabDialog(QtWidgets.QDialog, FORM_CLASS):
             mpo     = candidate['spinBox_min_point_per_octant']
 
             sse, n_valid = self._run_cv_sse(
-                coords, values, structures,
-                is_ok, is_sk, is_uk,
+                coords, values, setup['structures'],
+                setup['is_ok'], setup['is_sk'], setup['is_uk'],
                 float(rmax), float(rmin),
                 float(candidate['doubleSpinBox_search_azimuth']),
                 use_oct, int(mpo),
                 int(pmin), int(pmax),
-                mean_value, sample_variance, NO_VAL,
+                setup['mean_value'], setup['sample_variance'], setup['NO_VAL'],
             )
 
             # Level-1: all n points estimated
@@ -3555,10 +6283,77 @@ class GeostatisticsLabDialog(QtWidgets.QDialog, FORM_CLASS):
                 fallback_sse    = sse
                 fallback_params = dict(candidate)
 
-            if pb:
-                pb.setValue(int(iteration / N_ITER * 100))
-            if iteration % 5 == 0:
+            if progress_cb is not None:
+                progress_cb(iteration, n_trials)
+            if process_events and iteration % 5 == 0:
                 QtWidgets.QApplication.processEvents()
+
+        return {'best_sse': best_sse, 'best_params': best_params,
+                'fallback_valid': fallback_valid, 'fallback_sse': fallback_sse,
+                'fallback_params': fallback_params, 'completed': completed}
+
+    def run_ck_neighborhood_optimization(self):
+        """Random-search optimization of the kriging neighbourhood parameters
+        by minimizing the leave-one-out cross-validation SSE.
+
+        Only configurations where ALL data points can be estimated are
+        considered valid. Any candidate that leaves at least one point
+        unestimated receives a penalty of inf and is discarded, preventing
+        a spurious SSE reduction caused by skipping difficult points.
+
+        Algorithm
+        ---------
+        1. Read which parameters to optimize and their bounds from the
+           optimization table.
+        2. Run N_ITER random trials, each with a random combination of the
+           active parameters sampled within their bounds.
+        3. For each trial evaluate the LOO-CV SSE via _run_cv_sse().
+        4. Write the best parameter set back to the neighbourhood widgets.
+        """
+        import random
+
+        # Number of Latin Hypercube trials ("starting points"), chosen by the user
+        # in spinBoxstarting_points (the GUI default is 80). Guard against 0.
+        N_ITER = max(1, int(self.spinBoxstarting_points.value()))
+
+        # Seed of the Latin Hypercube sample plan (lineEdit_seed): the same seed
+        # gives the same trials, so the result can be repeated. Empty = random seed,
+        # which is written in the field.
+        ok, seed = self._read_seed_field(self.lineEdit_seed, "Seed")
+        if not ok:
+            return
+
+        # -- 1-3. Prerequisites, data, kriging type and parameter bounds -------
+        setup = self._ck_opt_read_setup(warn_default_model=True)
+        if setup is None:
+            return
+        coords = setup['coords']
+        values = setup['values']
+        tw     = setup['tw']
+        fixed  = setup['fixed']
+
+        # -- 4. Update "Current value" column before starting -----------------
+        for row, param in enumerate(self._CK_OPT_PARAMS):
+            cur_item = tw.item(row, self._COL_CUR)
+            if cur_item is not None:
+                cur_item.setText(str(fixed[param['widget']]))
+
+        # -- 5-6. Latin Hypercube sample plan and optimisation loop -----------
+        pb = self.progressBar_CK_opt if hasattr(self, 'progressBar_CK_opt') else None
+        if pb:
+            pb.setValue(0)
+
+        def _progress(iteration, total):
+            if pb:
+                pb.setValue(int(iteration / total * 100))
+
+        res = self._ck_opt_search(setup, N_ITER, random.Random(seed),
+                                  progress_cb=_progress, include_warm_start=True)
+        best_sse        = res['best_sse']
+        best_params     = res['best_params']
+        fallback_valid  = res['fallback_valid']
+        fallback_sse    = res['fallback_sse']
+        fallback_params = res['fallback_params']
 
         if pb:
             pb.setValue(100)
@@ -3642,10 +6437,104 @@ class GeostatisticsLabDialog(QtWidgets.QDialog, FORM_CLASS):
             f"Cross-validation SSE: "
             f"{'N/A' if chosen_sse == float('inf') else f'{chosen_sse:.6f}'}\n"
             f"Points estimated: {chosen_valid}/{len(values)}\n"
-            f"({N_ITER} Latin Hypercube trials + 1 warm-start)\n\n"
+            f"({N_ITER} Latin Hypercube trials + 1 warm-start, seed {seed})\n\n"
             "The kriging neighbourhood widgets have been updated.\n"
             "Run cross-validation again to confirm the result."
         )
+
+    def export_cross_kriging_to_csv(self):
+        """Export the leave-one-out cross-kriging table to a CSV file.
+
+        The rows are exactly those shown in tableView_cross_kriging (one per
+        input point, in the same order), at full numerical precision instead of
+        the 6 decimals used for display. Columns:
+
+            x, y                 - coordinates of the point
+            true_value           - observed value
+            estimated            - leave-one-out kriging estimate
+            krig_variance        - kriging variance
+            error                - true_value - estimated
+            error2               - error squared
+            error2_over_variance - error2 / krig_variance (the table colours a
+                                   row green when this is <= 1, red otherwise)
+
+        Points that could not be estimated (shown as "N/A" in the table) are
+        written with empty cells. Delimiter: comma; decimal separator: dot.
+        """
+        results = getattr(self, '_cross_val_results', None)
+        if not results:
+            QtWidgets.QMessageBox.warning(
+                self, "Export cross-kriging",
+                "No cross-kriging results are available yet.\n"
+                "Please run Calculate first.")
+            return
+
+        # -- 1. Build suggested filename (same convention as the other exports) --
+        import datetime, re
+        timestamp = datetime.datetime.now().strftime('%Y_%m_%d_%H_%M_%S')
+
+        # Layer / field / kriging type of the LAST cross-validation run, not the
+        # current combo box selection, which the user may have changed since.
+        layer_name = getattr(self, '_cross_val_layer_name', 'layer')
+        field_name = getattr(self, '_cross_val_field_name', 'variable')
+        ktype      = getattr(self, '_cross_val_ktype', 'krig')
+
+        def safe(s):
+            return re.sub(r'[\\/:*?"<>|]', '_', s)
+
+        suggested_name = (
+            f"{timestamp}_{safe(layer_name)}_{safe(field_name)}_cross_kriging_{ktype}.csv"
+        )
+
+        settings  = QSettings()
+        last_dir  = settings.value('GeostatisticsLab/export_dir',
+                                   os.path.expanduser('~'))
+        suggested = os.path.join(last_dir, suggested_name)
+
+        # -- 2. Save dialog ------------------------------------------------------
+        file_path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "Export cross-kriging table to CSV",
+            suggested,
+            "CSV files (*.csv);;All files (*.*)"
+        )
+        if not file_path:
+            return
+        if not file_path.lower().endswith('.csv'):
+            file_path += '.csv'
+        settings.setValue('GeostatisticsLab/export_dir',
+                          os.path.dirname(file_path))
+
+        # -- 3. Write the file ---------------------------------------------------
+        no_value = getattr(self, '_cross_val_NO_VALUE', -9999.0)
+
+        def fmt(value):
+            """Full-precision number, or an empty cell for NO_VALUE / NaN."""
+            if value is None or value == no_value or not np.isfinite(value):
+                return ''
+            return '%.12g' % value
+
+        try:
+            # newline='' lets the csv module control line endings (no blank
+            # lines on Windows); UTF-8 is used although the content is ASCII.
+            with open(file_path, 'w', newline='', encoding='utf-8') as fh:
+                writer = csv.writer(fh)
+                writer.writerow(['x', 'y', 'true_value', 'estimated',
+                                 'krig_variance', 'error', 'error2',
+                                 'error2_over_variance'])
+                for r in results:
+                    writer.writerow([fmt(r['x']), fmt(r['y']), fmt(r['true']),
+                                     fmt(r['estimated']), fmt(r['variance']),
+                                     fmt(r['error']), fmt(r['error2']),
+                                     fmt(r['ratio'])])
+            QtWidgets.QMessageBox.information(
+                self, "Export cross-kriging",
+                f"Cross-kriging table exported successfully:\n{file_path}\n"
+                f"({len(results)} rows)")
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(
+                self, "Export cross-kriging",
+                f"Failed to save the CSV file:\n{str(e)}")
 
     def run_cross_validation(self):
         """Leave-one-out cross-validation: estimate each input point excluding itself,
@@ -3723,7 +6612,12 @@ class GeostatisticsLabDialog(QtWidgets.QDialog, FORM_CLASS):
         # -- 3. Leave-one-out loop ---------------------------------------------
         results = []  # list of dicts, one per point
         self._cross_val_details = []  # list of detail-dicts (or None), one per point
-        self.progressBar_kriging.setValue(0)
+        self.progressBarCrossKriging.setValue(0)
+
+        # Start of the timed section (reported in CrossKriginComputingTime): the
+        # leave-one-out estimation of all n points. The preliminary warning dialog
+        # has already been answered, and no dialog is shown inside the loop.
+        t_cv_start = time.perf_counter()
         for i in range(n):
             x_i, y_i, z_i = float(X_known[i]), float(Y_known[i]), float(values[i])
             est, var, details = self._estimate_single_point(
@@ -3749,13 +6643,23 @@ class GeostatisticsLabDialog(QtWidgets.QDialog, FORM_CLASS):
                 'error': error, 'error2': error2, 'ratio': ratio,
                 'fid': fids[i]
             })
-            self.progressBar_kriging.setValue(int((i + 1) / n * 100))
+            self.progressBarCrossKriging.setValue(int((i + 1) / n * 100))
             if i % 10 == 0:
                 QtWidgets.QApplication.processEvents()
 
-        self.progressBar_kriging.setValue(100)
+        self.progressBarCrossKriging.setValue(100)
+
+        # End of the timed section: show the elapsed time. This happens before the
+        # table/vector-layer steps below, which may open a modal question dialog.
+        self.last_cross_kriging_time_s = time.perf_counter() - t_cv_start
+        self.CrossKriginComputingTime.setText(
+            "Computing time: " + self._format_elapsed_time(self.last_cross_kriging_time_s))
 
         # Store data needed by the neighbor map / weights table navigation
+        # (and by export_cross_kriging_to_csv)
+        self._cross_val_layer_name = layer.name()
+        self._cross_val_field_name = field_name
+        self._cross_val_ktype      = ktype
         self._cross_val_results  = results
         self._cross_val_X        = X_known
         self._cross_val_Y        = Y_known
@@ -4408,12 +7312,45 @@ class GeostatisticsLabDialog(QtWidgets.QDialog, FORM_CLASS):
                 if i % 2 == 0:
                     QtWidgets.QApplication.processEvents()
 
+            # Auto mode: pick the cell size at the minimum of the curve.
+            # For right-skewed data the minimum weighted mean corresponds to
+            # the most representative (least clustered) configuration.
+            is_auto = not (hasattr(self, 'radioButton_manual_declustering') and
+                           self.radioButton_manual_declustering.isChecked())
+            if is_auto:
+                best_idx = int(np.argmin(weighted_means))
+                best_cell_size = float(cell_sizes[best_idx])
+                if hasattr(self, 'doubleSpinBox_cell_size'):
+                    self.doubleSpinBox_cell_size.blockSignals(True)
+                    self.doubleSpinBox_cell_size.setValue(best_cell_size)
+                    self.doubleSpinBox_cell_size.blockSignals(False)
+
+            # Determine the cell size that will actually be used for weights
+            # (needed for the marker on the diagnostic plot).
+            final_cell_size_for_plot = (
+                self.doubleSpinBox_cell_size.value()
+                if hasattr(self, 'doubleSpinBox_cell_size')
+                else (float(cell_sizes[int(np.argmin(weighted_means))]) if is_auto else None)
+            )
+
             self.figure_decluster.clear()
             ax = self.figure_decluster.add_subplot(111)
             ax.plot(cell_sizes, weighted_means, marker='o', markersize=4,
                    color='#1f77b4', linewidth=1.3, label='Declustered mean')
             ax.axhline(naive_mean, color='red', linewidth=1.2, linestyle='--',
                       label='Naive mean (unweighted)')
+
+            # Mark the cell size that will be used for the final weights
+            if final_cell_size_for_plot is not None and cs_min <= final_cell_size_for_plot <= cs_max:
+                # Interpolate the weighted mean at the chosen cell size
+                wm_at_chosen = float(np.interp(final_cell_size_for_plot,
+                                                cell_sizes, weighted_means))
+                ax.axvline(final_cell_size_for_plot, color='#e67e22',
+                           linewidth=1.2, linestyle=':', alpha=0.85)
+                ax.plot(final_cell_size_for_plot, wm_at_chosen,
+                        marker='*', markersize=14, color='#e67e22',
+                        zorder=5, label='Selected cell size (%.4g)' % final_cell_size_for_plot)
+
             ax.set_xlabel('Cell size', fontsize=8)
             ax.set_ylabel('Weighted mean of %s' % field_name, fontsize=8)
             ax.set_title('Cell Declustering Diagnostic', fontsize=10)

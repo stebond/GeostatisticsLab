@@ -57,7 +57,7 @@ No additional installation is required.
 5. **Kriging tab** — choose **Ordinary**, configure the grid, press **Calculate!**
 6. **Probability Maps tab** — select the output rasters, set a threshold, press **Run!**
 
-Full step-by-step tutorials are in [`Docs/tutorial_sic97.md`](Docs/tutorial_sic97.md) and [`Docs/tutorial_walker_lake.md`](Docs/tutorial_walker_lake.md).
+Full step-by-step tutorials are in [`docs/tutorial_sic97.md`](docs/tutorial_sic97.md) and [`docs/tutorial_walker_lake.md`](docs/tutorial_walker_lake.md).
 
 ---
 
@@ -67,7 +67,7 @@ Two public benchmark datasets are included in `examples/`:
 
 | File | Description | Source |
 |---|---|---|
-| `sic97.dat` | 467 daily rainfall measurements in Switzerland (8 May 1986), 1/10 mm | Dubois (1998) |
+| `sic97.dat` | 100 daily rainfall measurements in Switzerland (8 May 1986), 1/10 mm | Dubois (1998) |
 | `walker_lake_samples_.dat` | 470-point sample of the Walker Lake dataset, variables V and U | Isaaks & Srivastava (1989) |
 
 ### Reproducing the paper results
@@ -84,7 +84,7 @@ Expected: principal direction ~N40 deg (GSLIB), anisotropy ratio ~5:1, two-struc
 
 **Walker Lake:**
 ```
-1. Load examples/walker_lake_samples.dat (X: x, Y: y, field: V)
+1. Load examples/walker_lake_samples_.dat (X: x, Y: y, field: V)
 2. Statistics -> Decluster (cell size ~20)
 3. Variogram -> adaptive_lag, use declustering weights -> Calculate -> Auto Fit (3 structures)
 4. Kriging -> Ordinary, 50x50 grid -> Calculate! -> Cross-Validation

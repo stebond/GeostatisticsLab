@@ -24,6 +24,7 @@ Developed at **DICAM – University of Bologna**.
   - [Kriging](#kriging-tab)
   - [Probability Maps](#probability-maps-tab)
 - [Example Datasets](#example-datasets)
+- [Reproducing the Paper Results](#reproducing-the-paper-results)
 - [Repository Structure](#repository-structure)
 - [Citation](#citation)
 - [License](#license)
@@ -85,7 +86,7 @@ All dependencies ship with the standard QGIS Python environment on Windows, macO
 
 1. Clone or download this repository:
    ```bash
-   git clone https://github.com/stebond/GeostatisticsLab.git
+   git clone https://github.com/[username]/GeostatisticsLab.git
    ```
 2. Copy the `GeostatisticsLab/` folder to your QGIS plugins directory:
    - **Windows:** `%APPDATA%\QGIS\QGIS3\profiles\default\python\plugins\`
@@ -107,7 +108,7 @@ After enabling the plugin, its icon should appear in the QGIS toolbar. Click it 
 5. In the **Kriging** tab: choose **Ordinary**, set the grid, press **Calculate!**
 6. In the **Probability Maps** tab: select the output rasters, set a threshold, press **Run!**
 
-A complete step-by-step tutorial is provided in [`/Docs/tutorial_sic97.md`](/Docs/tutorial_sic97.md).
+A complete step-by-step tutorial is provided in [`docs/tutorial_sic97.md`](docs/tutorial_sic97.md).
 
 ---
 
@@ -218,7 +219,7 @@ Two public benchmark datasets are included in `examples/`:
 
 ### `sic97.dat`
 - **Source:** Dubois, G. (1998). Spatial interpolation comparison 97. *Journal of Geographic Information and Decision Analysis* 2(2), 1–10.
-- **Content:** 467 measurements of rainfall, Switzerland.
+- **Content:** 200 measurements of Caesium-137 deposition (Bq/m²) after the Chernobyl accident, southern Germany.
 - **Columns:** `x` (Easting, m), `y` (Northing, m), `value` (Bq/m²)
 - **Delimiter:** space
 - **Recommended field:** `value`
@@ -232,6 +233,9 @@ Two public benchmark datasets are included in `examples/`:
 
 ---
 
+## Reproducing the Paper Results
+
+The results in [*GeostatisticsLab: An open-source QGIS plugin for complete geostatistical workflows* (Computers & Geosciences, in review)] can be reproduced as follows.
 
 ### SIC97 case study
 
